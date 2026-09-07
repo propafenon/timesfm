@@ -36,7 +36,7 @@ except ImportError:
         EVALUATOR_MODE = "timesfm3"
         TIMESFM_AVAILABLE = True
     except ImportError:
-        print("timesfm is not installed or configured. Running in UI-only/Mock mode.")
+        print("timesfm is not installed or configured. Inference will fail.")
         TIMESFM_AVAILABLE = False
 
 
@@ -63,7 +63,7 @@ class TimesFMApp:
         self.setup_ui()
         self.log_message("System initialized. Ready to fetch data.")
         if not TIMESFM_AVAILABLE:
-            self.log_message("WARNING: 'timesfm' module not found. Model will run in Mock Mode.", "warning")
+            self.log_message("WARNING: 'timesfm' module not found. Inference will fail.", "warning")
 
         #  Initialize the database
         try: 
@@ -71,6 +71,13 @@ class TimesFMApp:
             self.log_message("Database initialized successfully.")
         except Exception as e:
             self.log_message(f"Database initialization failed: {str(e)}", "error")
+
+        try:
+            populate_thread = threading.Thread(target=self.refresh_forecast_history, daemon=True)
+            populate_thread.start() 
+            self.log_message(f"History succesfully populated: {len(self.run_tree.get_children())} records loaded.")
+        except Exception as e:
+            self.log_message(f"Failed to populate forecast history on startup: {str(e)}", "error")
 
     def setup_ui(self):
 
@@ -87,6 +94,7 @@ class TimesFMApp:
         parent_notebook.add(tab_logs, text="System Logs")
         parent_notebook.add(tab_settings, text="Model Settings")
 
+        # INFERENCE & VISUALIZATION TAB
         left_panel = ttk.Frame(tab_inference, width=350, padding=(10, 10, 10, 10))
         left_panel.pack(side="left", fill="y", expand=False)
         
@@ -105,6 +113,37 @@ class TimesFMApp:
         
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+        # LOGS AND QC TAB: tab_logs
+        
+        self.data_grid_frame = ttk.LabelFrame(tab_logs, text="Forecast History", padding=(10, 10, 10, 10))
+        self.data_grid_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ## DATA GRID and children
+        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "MAE Score"), show="headings")
+        self.run_tree.pack(fill="both", expand=True, side="left")
+        self.run_tree.heading("ID", text="ID",)
+        self.run_tree.heading("Timestamp", text="Timestamp")
+        self.run_tree.heading("Ticker", text="Ticker")
+        self.run_tree.heading("Interval", text="Interval")
+        self.run_tree.heading("Context Length", text="Context Length")
+        self.run_tree.heading("Horizon Length", text="Horizon Length")
+        self.run_tree.heading("Model Repo", text="Model Repo")
+        self.run_tree.heading("Period", text="Period")
+        self.run_tree.heading("MAE Score", text="MAE Score")
+
+        tree_scrollbar_horizontal = ttk.Scrollbar(self.data_grid_frame, orient="horizontal", command=self.run_tree.xview)
+        tree_scrollbar_vertical = ttk.Scrollbar(self.data_grid_frame, orient="vertical", command=self.run_tree.yview)
+        tree_scrollbar_horizontal.pack(side="bottom", fill="x")
+        tree_scrollbar_vertical.pack(side="right", fill="y")
+        self.run_tree.configure(xscrollcommand=tree_scrollbar_horizontal.set, yscrollcommand=tree_scrollbar_vertical.set)
+
+        ### Configure treeview columns
+        self.qc_controls_frame = ttk.LabelFrame(tab_logs, text="QC Controls")
+        self.qc_controls_frame.pack(fill="x", pady=(0, 10), padx=10)
+        
+
+
         
         self.build_data_settings()
         self.build_model_settings()
@@ -140,7 +179,7 @@ class TimesFMApp:
         ttk.Combobox(data_frame, textvariable=self.interval_var, values=["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"], width=13, state="readonly").grid(row=1, column=1, sticky="w", pady=2)
         
         ttk.Label(data_frame, text="Data Period:").grid(row=2, column=0, sticky="w", pady=2)
-        self.period_var = tk.StringVar(value="2y")
+        self.period_var = tk.StringVar(value="max")
         ttk.Combobox(data_frame, textvariable=self.period_var, values=["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"], width=13, state="readonly").grid(row=2, column=1, sticky="w", pady=2)
         
         ttk.Label(data_frame, text="Target Column:").grid(row=3, column=0, sticky="w", pady=2)
@@ -156,39 +195,51 @@ class TimesFMApp:
         ttk.Entry(model_frame, textvariable=self.repo_var, width=32).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0,5))
         
         ttk.Label(model_frame, text="Context Length (Input):").grid(row=2, column=0, sticky="w", pady=2)
-        self.context_len_var = tk.IntVar(value=512)
+        self.context_len_var = tk.IntVar(value=1056)
         ttk.Entry(model_frame, textvariable=self.context_len_var, width=10).grid(row=2, column=1, sticky="e", pady=2)
         
         ttk.Label(model_frame, text="Horizon Length (Output):").grid(row=3, column=0, sticky="w", pady=2)
-        self.horizon_var = tk.IntVar(value=64)
+        self.horizon_var = tk.IntVar(value=7)
         ttk.Entry(model_frame, textvariable=self.horizon_var, width=10).grid(row=3, column=1, sticky="e", pady=2)
         
         ttk.Label(model_frame, text="Compute Backend:").grid(row=4, column=0, sticky="w", pady=2)
-        self.backend_var = tk.StringVar(value="cpu")
+        self.backend_var = tk.StringVar(value="gpu")
         ttk.Combobox(model_frame, textvariable=self.backend_var, values=["cpu", "gpu", "tpu"], width=8, state="readonly").grid(row=4, column=1, sticky="e", pady=2)
         
         ttk.Label(model_frame, text="Freq Indicator (0=High, 1=Min...):").grid(row=5, column=0, sticky="w", pady=2)
         self.freq_ind_var = tk.IntVar(value=0)
         ttk.Entry(model_frame, textvariable=self.freq_ind_var, width=10).grid(row=5, column=1, sticky="e", pady=2)
 
-        self.mock_mode_var = tk.BooleanVar(value=not TIMESFM_AVAILABLE)
-        cb = ttk.Checkbutton(model_frame, text="Force Mock Mode (No GPU/API)", variable=self.mock_mode_var)
-        cb.grid(row=6, column=0, columnspan=2, sticky="w", pady=5)
-        if not TIMESFM_AVAILABLE:
-            cb.state(['disabled'])
-
     def build_action_buttons(self):
+
+        ## SETTINGS_FRAME BUTTONS - TAB 1
         btn_frame = ttk.Frame(self.settings_frame, padding=(5, 5))
         btn_frame.pack(fill=tk.X, pady=10)
         
-        self.fetch_btn = ttk.Button(btn_frame, text="1. Fetch Data", command=self.thread_fetch_data)
+        self.fetch_btn = ttk.Button(btn_frame, text="Fetch Data", command=self.thread_fetch_data)
         self.fetch_btn.pack(fill=tk.X, pady=2)
         
-        self.run_btn = ttk.Button(btn_frame, text="2. Run TimesFM Forecast", command=self.thread_run_forecast)
+        self.run_btn = ttk.Button(btn_frame, text="Run Forecast", command=self.thread_run_forecast)
         self.run_btn.pack(fill=tk.X, pady=2)
+
+        self.insert_db_btn = ttk.Button(btn_frame, text="Save Forecast to DB", command=self.save_forecast_to_db)
+        self.insert_db_btn.pack(fill=tk.X, pady=2)
         
-        self.save_btn = ttk.Button(btn_frame, text="3. Export Results as CSV", command=self.export_csv)
+        self.save_btn = ttk.Button(btn_frame, text="Export Results as CSV", command=self.export_csv)
         self.save_btn.pack(fill=tk.X, pady=2)
+
+        ## QC CONTROLS FRAME BUTTONS - TAB 2
+        self.refresh_btn = ttk.Button(self.qc_controls_frame, text="Refresh", command=self.refresh_forecast_history, width=6)
+        self.refresh_btn.pack(side=tk.LEFT, padx=5, pady=5, )
+
+        self.overlay_btn = ttk.Button(self.qc_controls_frame, text="Overlay Selected Forecast", command=self.overlay_selected_forecast, width=18)
+        self.overlay_btn.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.calculate_mae_btn = ttk.Button(self.qc_controls_frame, text="Calculate MAE for Selected", command=self.calculate_mae_for_selected, width=20)
+        self.calculate_mae_btn.pack(side=tk.LEFT, padx=5, pady=5)
+        
+        self.delete_btn = ttk.Button(self.qc_controls_frame, text="Delete Selected Forecast", command=self.delete_selected_forecast)
+        self.delete_btn.pack(side=tk.LEFT, padx=5, pady=5)
 
     def init_plot(self):
         if FigureCanvasTkAgg is None:
@@ -307,96 +358,71 @@ class TimesFMApp:
             input_context = time_series[-context_len:]
             forecast_input = [input_context]
             
-            is_mock = self.mock_mode_var.get()
-
-            if is_mock or not TIMESFM_AVAILABLE:
-                self.root.after(0, self.log_message, "Running in MOCK MODE (simulating model inference).")
-                import time
-                time.sleep(2)
+            if not TIMESFM_AVAILABLE:
+                raise ImportError("timesfm library is not available. Cannot run forecast.")
                 
-                last_val = input_context[-1]
-                volatility = np.std(input_context) * 0.1
-                drift = (input_context[-1] - input_context[0]) / max(1, context_len)
+            # IMPLEMENT MODEL CACHING TO PREVENT OOM CRASHES AND HEAVY BOTTLENECKS
+            current_request_config = {
+                "repo": self.repo_var.get(),
+                "context_len": context_len,
+                "horizon": horizon,
+                "backend": self.backend_var.get()
+            }
+            
+            if self.loaded_model is None or self.current_model_config != current_request_config:
+                self.root.after(0, self.log_message, f"Hardware loading TimesFM Model from {current_request_config['repo']} (this takes time)...")
                 
-                mock_forecast = [last_val + drift * i + np.random.normal(0, volatility) for i in range(1, horizon + 1)]
-                forecast_result = np.array(mock_forecast)
-                
-            else:
-                # IMPLEMENT MODEL CACHING TO PREVENT OOM CRASHES AND HEAVY BOTTLENECKS
-                current_request_config = {
-                    "repo": self.repo_var.get(),
-                    "context_len": context_len,
-                    "horizon": horizon,
-                    "backend": self.backend_var.get()
-                }
-                
-                if self.loaded_model is None or self.current_model_config != current_request_config:
-                    self.root.after(0, self.log_message, f"Hardware loading TimesFM Model from {current_request_config['repo']} (this takes time)...")
-                    
-                    device_target = current_request_config["backend"]
-                    import sys
-                    if sys.platform == "darwin" and device_target == "gpu":
-                        device_target = "mps"
-                        self.root.after(0, self.log_message, "macOS detected: Mapped GPU to Apple MPS.")
-                    
-                    if EVALUATOR_MODE == "timesfm3":
-                        # Actual TimesFM 3.0 Configuration
-                        config = ModelConfig(
-                            checkpoint_path=current_request_config["repo"],
-                            device=device_target,
-                            per_core_batch_size=1
-                        )
-                        self.loaded_model = TimesFM3Evaluator(config)
-                    else:
-                        self.loaded_model = timesfm.TimesFm(
-                            context_len=context_len,
-                            horizon_len=horizon,
-                            input_patch_len=input_patch_len,
-                            output_patch_len=128,
-                            num_layers=20,
-                            model_dims=1280,
-                            backend=device_target
-                        )
-                        self.loaded_model.load_from_checkpoint(repo_id=current_request_config["repo"])
-                        
-                    self.current_model_config = current_request_config
-                else:
-                    self.root.after(0, self.log_message, "Using cached model weights in VRAM/RAM...")
-                
-                self.root.after(0, self.log_message, "Running inference on prepared context data...")
-                
-                # Run the actual prediction
-                input_context = input_context.astype(np.float32)
+                device_target = current_request_config["backend"]
+                import sys
+                if sys.platform == "darwin" and device_target == "gpu":
+                    device_target = "mps"
+                    self.root.after(0, self.log_message, "macOS detected: Mapped GPU to Apple MPS.")
                 
                 if EVALUATOR_MODE == "timesfm3":
-                    # TimesFM 3.0 uses predict_batch instead of forecast
-                    outputs = list(self.loaded_model.predict_batch(
-                        [input_context],
-                        horizon=horizon,
-                        return_quantiles=False,
-                        use_symmetric_averaging=False
-                    ))
-                    forecast_result = outputs[0].forecast
+                    # Actual TimesFM 3.0 Configuration
+                    config = ModelConfig(
+                        checkpoint_path=current_request_config["repo"],
+                        device=device_target,
+                        per_core_batch_size=1
+                    )
+                    self.loaded_model = TimesFM3Evaluator(config)
                 else:
-                    freq_ind = [self.freq_ind_var.get()]
-                    point_forecast, _ = self.loaded_model.forecast([input_context], freq=freq_ind)
-                    forecast_result = point_forecast[0]
+                    self.loaded_model = timesfm.TimesFm(
+                        context_len=context_len,
+                        horizon_len=horizon,
+                        input_patch_len=input_patch_len,
+                        output_patch_len=128,
+                        num_layers=20,
+                        model_dims=1280,
+                        backend=device_target
+                    )
+                    self.loaded_model.load_from_checkpoint(repo_id=current_request_config["repo"])
+                    
+                self.current_model_config = current_request_config
+            else:
+                self.root.after(0, self.log_message, "Using cached model weights in VRAM/RAM...")
+            
+            self.root.after(0, self.log_message, "Running inference on prepared context data...")
+            
+            # Run the actual prediction
+            input_context = input_context.astype(np.float32)
+            
+            if EVALUATOR_MODE == "timesfm3":
+                # TimesFM 3.0 uses predict_batch instead of forecast
+                outputs = list(self.loaded_model.predict_batch(
+                    [input_context],
+                    horizon=horizon,
+                    return_quantiles=False,
+                    use_symmetric_averaging=False
+                ))
+                forecast_result = outputs[0].forecast
+            else:
+                freq_ind = [self.freq_ind_var.get()]
+                point_forecast, _ = self.loaded_model.forecast([input_context], freq=freq_ind)
+                forecast_result = point_forecast[0]
 
             self.forecast_data = forecast_result
-
-
-            # Save to database
-            db_manager.insert_forecast(
-                ticker=self.tkr_var.get(),
-                interval=self.interval_var.get(),
-                context_length=context_len,
-                horizon_length=horizon,
-                model_repo=self.repo_var.get(),
-                period=self.period_var.get(),
-                forecast_data=forecast_result.tolist(),
-                mae_score=None  # Placeholder for MAE score, can be computed later if needed
-            )
-
+            
             self.root.after(0, self._on_forecast_success)
             
         except Exception as e:
@@ -407,6 +433,27 @@ class TimesFMApp:
         self.log_message("Forecast completed successfully.")
         self.update_plot()
         self.set_processing_state(False)
+
+    def save_forecast_to_db(self):
+        # 1. Safety check: make sure a forecast actually exists first!
+        if self.forecast_data is None:
+            messagebox.showwarning("Warning", "No forecast data to save. Run a forecast first.")
+            return
+
+        try:
+            db_manager.insert_forecast(
+                            ticker=self.tkr_var.get(),
+                            interval=self.interval_var.get(),
+                            context_length=self.context_len_var.get(),
+                            horizon_length=self.horizon_var.get(),
+                            model_repo=self.repo_var.get(),
+                            period=self.period_var.get(),
+                            forecast_data=self.forecast_data.tolist(),
+                            mae_score=None  # Placeholder for MAE score, can be computed later if needed
+                        )
+            self.root.after(0, self.log_message, "Forecast results saved to database successfully.")
+        except Exception as db_e:
+                        self.root.after(0, self.log_message, f"Database save failed: {str(db_e)}", "error")
 
     def _on_process_error(self, error_msg):
         self.log_message(f"ERROR: {error_msg}")
@@ -483,6 +530,38 @@ class TimesFMApp:
             self.log_message(f"Forecast successfully exported to {filepath}")
         except Exception as e:
             self.log_message(f"Export Error: {str(e)}")
+
+    def refresh_forecast_history(self):
+        try:
+            history = db_manager.get_forecast_history()
+            self.run_tree.delete(*self.run_tree.get_children())
+            
+            for record in history:
+                self.run_tree.insert("", "end", values=(
+                    record['id'],
+                    record['timestamp'],
+                    record['ticker'],
+                    record['interval'],
+                    record['context_length'],
+                    record['horizon_length'],
+                    record['model_repo'],
+                    record['period'],
+                    record['mae_score']
+                ))
+            self.log_message("Forecast history grid updated successfully.")
+        except Exception as e:
+            self.log_message(f"Error populating forecast history: {str(e)}", "error")
+
+    
+    # TODO     
+    def overlay_selected_forecast(self): 
+        return
+    # TODO     
+    def calculate_mae_for_selected(self):
+        return
+    # TODO     
+    def delete_selected_forecast(self):
+        return
 
 if __name__ == "__main__":
     root = tk.Tk()

@@ -42,6 +42,36 @@ def insert_forecast(ticker, interval, context_length, horizon_length, model_repo
     conn.close()
 
 
+def get_forecast_history():
+    conn = sq3.connect('./runs/forecast_history.db')
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT * FROM forecast_runs ORDER BY timestamp DESC')
+    rows = cursor.fetchall()
+
+    # Deserialize the forecast_data using pickle
+    history = []
+    for row in rows:
+        id, timestamp, ticker, interval, context_length, horizon_length, model_repo, period, forecast_data_blob, mae_score = row
+        forecast_data = pickle.loads(forecast_data_blob)
+        history.append({
+            'id': id,
+            'timestamp': timestamp,
+            'ticker': ticker,
+            'interval': interval,
+            'context_length': context_length,
+            'horizon_length': horizon_length,
+            'model_repo': model_repo,
+            'period': period,
+            'forecast_data': forecast_data,
+            'mae_score': mae_score
+        })
+
+    conn.close()
+    return history
+
+
+
 init_db()
    
 
