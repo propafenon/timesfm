@@ -1,0 +1,379 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import datetime
+import threading
+import traceback
+import sys
+
+# Attempt to load timesfm, if it fails, capture the exact error for the UI logs
+try:
+    import timesfm
+    # We look for the 3.0 evaluator specifically or standard TimesFm depending on package spec
+    try:
+        from timesfm import timesfm3
+        EVALUATOR_MODE = "timesfm3"
+    except ImportError:
+        EVALUATOR_MODE = "standard"
+    HAS_TIMESFM = True
+    TIMESFM_ERR = ""
+except Exception as e:
+    HAS_TIMESFM = False
+    TIMESFM_ERR = traceback.format_exc()
+
+class TimesFMApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("TimesFM 3.0 Stock Forecaster")
+        self.root.geometry("1100x800")
+        
+        # State variables
+        self.is_processing = False
+        self.historical_data = None
+        self.loaded_model = None
+        self.current_model_config = None
+        self.mock_mode = not HAS_TIMESFM
+        
+        self.setup_ui()
+        self.init_plot()
+        
+        # Log initial state
+        if self.mock_mode:
+            self.log_message("WARNING: 'timesfm' module not found or failed to load. Running in Mock Mode.", "error")
+            self.log_message(f"Traceback details:\n{TIMESFM_ERR}", "error")
+        else:
+            self.log_message("System Ready. TimesFM loaded successfully.")
+
+    def setup_ui(self):
+        # Main layout
+        left_panel = ttk.Frame(self.root, width=300, padding=10)
+        left_panel.pack(side=tk.LEFT, fill=tk.Y, expand=False)
+        
+        right_panel = ttk.Frame(self.root, padding=10)
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # --- LEFT PANEL: DATA SETTINGS ---
+        data_frame = ttk.LabelFrame(left_panel, text="1. Market Data", padding=10)
+        data_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(data_frame, text="Ticker Symbol:").pack(anchor=tk.W)
+        self.tkr_var = tk.StringVar(value="AAPL")
+        ttk.Entry(data_frame, textvariable=self.tkr_var).pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(data_frame, text="Interval:").pack(anchor=tk.W)
+        self.interval_var = tk.StringVar(value="1d")
+        intervals = ["1d", "1wk", "1mo", "1h"]
+        ttk.Combobox(data_frame, textvariable=self.interval_var, values=intervals, state="readonly").pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(data_frame, text="Start Date (YYYY-MM-DD):").pack(anchor=tk.W)
+        self.start_date_var = tk.StringVar(value=(datetime.date.today() - datetime.timedelta(days=365)).strftime("%Y-%m-%d"))
+        ttk.Entry(data_frame, textvariable=self.start_date_var).pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(data_frame, text="End Date:").pack(anchor=tk.W)
+        self.end_date_var = tk.StringVar(value=datetime.date.today().strftime("%Y-%m-%d"))
+        ttk.Entry(data_frame, textvariable=self.end_date_var).pack(fill=tk.X, pady=(0, 10))
+        
+        self.fetch_btn = ttk.Button(data_frame, text="Fetch Data", command=self.thread_fetch_data)
+        self.fetch_btn.pack(fill=tk.X, pady=(5, 0))
+
+        # --- LEFT PANEL: MODEL SETTINGS ---
+        model_frame = ttk.LabelFrame(left_panel, text="2. TimesFM Config", padding=10)
+        model_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Label(model_frame, text="Context Length (Historical Steps):").pack(anchor=tk.W)
+        self.ctx_var = tk.IntVar(value=512)
+        ttk.Entry(model_frame, textvariable=self.ctx_var).pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(model_frame, text="Horizon Length (Future Steps):").pack(anchor=tk.W)
+        self.hz_var = tk.IntVar(value=30)
+        ttk.Entry(model_frame, textvariable=self.hz_var).pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(model_frame, text="HF Repo ID:").pack(anchor=tk.W)
+        self.repo_var = tk.StringVar(value="google/timesfm-3.0-pytorch")
+        ttk.Entry(model_frame, textvariable=self.repo_var).pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(model_frame, text="Hardware Backend:").pack(anchor=tk.W)
+        self.backend_var = tk.StringVar(value="cpu")
+        backends = ["cpu", "gpu", "tpu", "mps"]
+        ttk.Combobox(model_frame, textvariable=self.backend_var, values=backends, state="readonly").pack(fill=tk.X, pady=(0, 10))
+
+        # --- LEFT PANEL: ACTIONS ---
+        btn_frame = ttk.Frame(left_panel)
+        btn_frame.pack(fill=tk.X, pady=10)
+        
+        self.run_btn = ttk.Button(btn_frame, text="3. Run TimesFM Forecast", command=self.thread_run_forecast)
+        self.run_btn.pack(fill=tk.X, pady=2)
+        
+        self.clear_btn = ttk.Button(btn_frame, text="4. Clear Plot & Cache", command=self.clear_cache_and_plot)
+        self.clear_btn.pack(fill=tk.X, pady=2)
+        
+        # Progress Bar and Status Label
+        self.progress_bar = ttk.Progressbar(btn_frame, mode='indeterminate')
+        self.progress_bar.pack(fill=tk.X, pady=(15, 2))
+        
+        self.status_label = ttk.Label(btn_frame, text="Ready", foreground="gray", anchor="center")
+        self.status_label.pack(fill=tk.X, pady=2)
+
+        # --- RIGHT PANEL: PLOT & LOGS ---
+        plot_frame = ttk.Frame(right_panel)
+        plot_frame.pack(fill=tk.BOTH, expand=True)
+        
+        self.fig, self.ax = plt.subplots(figsize=(8, 5))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        toolbar = NavigationToolbar2Tk(self.canvas, plot_frame)
+        toolbar.update()
+        
+        log_frame = ttk.LabelFrame(right_panel, text="System Logs", padding=5)
+        log_frame.pack(fill=tk.X, pady=(10, 0), expand=False)
+        
+        self.log_text = tk.Text(log_frame, height=8, state='disabled', font=("Courier", 12))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def init_plot(self):
+        self.ax.clear()
+        self.ax.set_title("TimesFM Forecast Preview", fontsize=14)
+        self.ax.set_xlabel("Date")
+        self.ax.set_ylabel("Price")
+        self.ax.grid(True, linestyle='--', alpha=0.6)
+        self.canvas.draw()
+
+    def log_message(self, message, level="info"):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        formatted_msg = f"[{timestamp}] {message}\n"
+        
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, formatted_msg)
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
+        self.root.update_idletasks()
+
+    def set_processing_state(self, state, status=""):
+        self.is_processing = state
+        if state:
+            self.fetch_btn.state(['disabled'])
+            self.run_btn.state(['disabled'])
+            self.clear_btn.state(['disabled'])
+            self.progress_bar.start(15)
+            self.status_label.config(text=status if status else "Processing...", foreground="#007aff")
+        else:
+            self.fetch_btn.state(['!disabled'])
+            self.run_btn.state(['!disabled'])
+            self.clear_btn.state(['!disabled'])
+            self.progress_bar.stop()
+            self.status_label.config(text="Ready", foreground="gray")
+
+    def clear_cache_and_plot(self):
+        # 1. Clear Data
+        self.historical_data = None
+        
+        # 2. Clear Model & Cache from Memory
+        if self.loaded_model is not None:
+            self.log_message("Clearing TimesFM Model from hardware memory...")
+            del self.loaded_model
+            self.loaded_model = None
+            self.current_model_config = None
+            
+        # 3. Reset Plot
+        self.init_plot()
+        self.log_message("Cache and Plot have been cleared.")
+
+    def thread_fetch_data(self):
+        if self.is_processing: return
+        self.set_processing_state(True, status="Fetching Market Data...")
+        self.log_message(f"Fetching data for {self.tkr_var.get()}...")
+        threading.Thread(target=self._fetch_data_job, daemon=True).start()
+
+    def _fetch_data_job(self):
+        try:
+            ticker = self.tkr_var.get()
+            df = yf.download(
+                ticker, 
+                start=self.start_date_var.get(), 
+                end=self.end_date_var.get(), 
+                interval=self.interval_var.get(),
+                progress=False,
+                timeout=10 # Prevents yfinance hanging on bad network
+            )
+            
+            if df.empty:
+                self.root.after(0, self.log_message, "No data fetched. Check dates and ticker.", "error")
+                return
+                
+            self.historical_data = df
+            self.root.after(0, self.log_message, f"Successfully fetched {len(df)} rows.")
+            self.root.after(0, self._plot_historical)
+        except Exception as e:
+            self.root.after(0, self.log_message, f"Fetch Error: {str(e)}", "error")
+        finally:
+            self.root.after(0, lambda: self.set_processing_state(False))
+
+    def _plot_historical(self):
+        self.ax.clear()
+        if 'Close' in self.historical_data.columns:
+            # Handle multi-level index from yfinance if present
+            close_data = self.historical_data['Close']
+            if isinstance(close_data, pd.DataFrame):
+                close_data = close_data.iloc[:, 0]
+                
+            self.ax.plot(self.historical_data.index, close_data, label='Historical Close', color='blue')
+            self.ax.set_title(f"{self.tkr_var.get()} Historical Data")
+            self.ax.legend()
+            self.ax.grid(True, linestyle='--', alpha=0.6)
+            self.canvas.draw()
+
+    def thread_run_forecast(self):
+        if self.is_processing: return
+        if self.historical_data is None or self.historical_data.empty:
+            messagebox.showwarning("Warning", "Please fetch data first.")
+            return
+            
+        self.set_processing_state(True, status="Preparing Data Sequence...")
+        self.log_message("Initializing forecast sequence...")
+        threading.Thread(target=self._run_forecast_job, daemon=True).start()
+
+    def _run_forecast_job(self):
+        try:
+            context_len = self.ctx_var.get()
+            horizon_len = self.hz_var.get()
+            
+            # TimesFM requires context_len to be a multiple of input_patch_len (usually 32)
+            patch_len = 32
+            if context_len % patch_len != 0:
+                context_len = ((context_len // patch_len) + 1) * patch_len
+                self.root.after(0, self.log_message, f"Auto-adjusted context length to {context_len} (must be multiple of {patch_len})")
+
+            # Extract 1D array of close prices
+            close_series = self.historical_data['Close']
+            if isinstance(close_series, pd.DataFrame):
+                close_series = close_series.iloc[:, 0]
+            
+            context_data = close_series.values[-context_len:]
+            if len(context_data) < context_len:
+                # Pad with zeros if we don't have enough data
+                pad_size = context_len - len(context_data)
+                context_data = np.pad(context_data, (pad_size, 0), 'constant', constant_values=(context_data[0] if len(context_data) > 0 else 0))
+                self.root.after(0, self.log_message, f"Padded input data with {pad_size} values to meet context length requirement.")
+
+            forecast_values = []
+            
+            if self.mock_mode:
+                self.root.after(0, lambda: self.status_label.config(text="Running Mock Inference...", foreground="#d97706"))
+                self.root.after(0, self.log_message, "Running Mock Inference (No TimesFM installed)...")
+                
+                # Generate a mock random walk for demonstration
+                import time
+                time.sleep(2) # Simulate processing time
+                last_val = context_data[-1] if len(context_data) > 0 else 100
+                drift = 0.001
+                volatility = 0.015
+                
+                mock_forecast = []
+                for _ in range(horizon_len):
+                    change = np.random.normal(drift, volatility)
+                    last_val = last_val * (1 + change)
+                    mock_forecast.append(last_val)
+                forecast_values = np.array(mock_forecast)
+                
+            else:
+                current_request_config = {
+                    "repo": self.repo_var.get(),
+                    "backend": self.backend_var.get(),
+                    "context": context_len,
+                    "horizon": horizon_len
+                }
+                
+                # Check if we need to load or reload the model based on configuration changes
+                if self.loaded_model is None or self.current_model_config != current_request_config:
+                    self.root.after(0, lambda: self.status_label.config(text="Downloading / Loading Model...", foreground="#d97706"))
+                    self.root.after(0, self.log_message, f"Loading Model from {current_request_config['repo']} (this takes time)...")
+                    
+                    device_target = current_request_config["backend"]
+                    if sys.platform == "darwin" and device_target == "gpu":
+                        device_target = "mps" # Auto-map Mac GPU setting to Metal Performance Shaders
+                        self.root.after(0, self.log_message, "macOS detected: Mapped GPU to Apple MPS.")
+
+                    # TimesFM 3.0+ architecture loading
+                    config = timesfm.TimesFmConfig(
+                        huggingface_repo_id=current_request_config["repo"],
+                        backend=device_target,
+                        context_len=current_request_config["context"],
+                        horizon_len=current_request_config["horizon"],
+                    )
+                    
+                    if EVALUATOR_MODE == "timesfm3":
+                        self.loaded_model = timesfm3.TimesFM3Evaluator(config)
+                    else:
+                        self.loaded_model = timesfm.TimesFm(config)
+                        
+                    self.current_model_config = current_request_config
+                else:
+                    self.root.after(0, self.log_message, "Using cached model weights in VRAM/RAM...")
+                
+                self.root.after(0, lambda: self.status_label.config(text="Running AI Inference...", foreground="#007aff"))
+                self.root.after(0, self.log_message, "Running AI inference on sequence...")
+                
+                context_data = context_data.astype(np.float32)
+                
+                # Execute model prediction
+                if EVALUATOR_MODE == "timesfm3":
+                    outputs = self.loaded_model.forecast([context_data])
+                else:
+                    outputs = self.loaded_model.forecast([context_data], [0]) # 0 for default frequency
+                
+                forecast_values = outputs[0] if isinstance(outputs, tuple) else outputs
+
+            self.root.after(0, self.log_message, "Inference complete! Rendering plot...")
+            
+            # Generate Future Dates safely
+            last_date = self.historical_data.index[-1]
+            interval = self.interval_var.get()
+            
+            if interval == "1d":
+                future_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=horizon_len)
+            else:
+                freq_map = {"1wk": "W", "1mo": "ME", "1h": "h"}
+                future_dates = pd.date_range(start=last_date + pd.Timedelta(hours=1), periods=horizon_len, freq=freq_map.get(interval, "D"))
+
+            # Dispatch UI update safely
+            self.root.after(0, lambda: self._update_plot_with_forecast(future_dates, forecast_values))
+            
+        except Exception as e:
+            err_msg = traceback.format_exc()
+            self.root.after(0, self.log_message, f"Forecast Error: {str(e)}", "error")
+            print(err_msg) # Print to terminal for debugging
+        finally:
+            self.root.after(0, lambda: self.set_processing_state(False))
+
+    def _update_plot_with_forecast(self, future_dates, forecast_values):
+        # Extract 1D array safely
+        if isinstance(forecast_values, pd.DataFrame):
+            forecast_values = forecast_values.iloc[:, 0].values
+        elif hasattr(forecast_values, 'shape') and len(forecast_values.shape) > 1:
+            forecast_values = np.squeeze(forecast_values)
+
+        # Plot the new AI predictions
+        self.ax.plot(future_dates, forecast_values, label='TimesFM 3.0 Forecast', color='orange', linestyle='--', linewidth=2)
+        
+        # Connect the last historical point to the first forecast point
+        close_series = self.historical_data['Close']
+        if isinstance(close_series, pd.DataFrame):
+            close_series = close_series.iloc[:, 0]
+            
+        last_hist_date = self.historical_data.index[-1]
+        last_hist_val = close_series.iloc[-1]
+        self.ax.plot([last_hist_date, future_dates[0]], [last_hist_val, forecast_values[0]], color='orange', linestyle='--', linewidth=2)
+        
+        self.ax.legend()
+        self.canvas.draw()
+        self.log_message("Forecast successfully rendered.")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = TimesFMApp(root)
+    root.mainloop()
