@@ -11,7 +11,10 @@ import backtest
 import metrics
 import transforms
 import csv
+import os  # Added for scanning local model directories
 import sys
+# Used to safely build public FRED CSV query URLs for custom economic series.
+from urllib.parse import quote
 
 try:
     import yfinance as yf
@@ -26,6 +29,12 @@ try:
 except ImportError:
     print("matplotlib is not installed. Please install it using: pip install matplotlib")
     FigureCanvasTkAgg = None
+
+try:
+    from huggingface_hub import snapshot_download
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    HF_HUB_AVAILABLE = False
 
 try:
     import timesfm
@@ -48,6 +57,7 @@ except ImportError:
 
 class TimesFMApp:
     def __init__(self, root):
+        """Construct the UI, initialize storage, and load saved history asynchronously."""
         self.root = root
         self.root.title("TimesFM 3.0 Stock Data Forecaster")
         self.root.geometry("1400x850")
@@ -56,8 +66,17 @@ class TimesFMApp:
         # Internal state variables
         self.historical_data = None
         self.forecast_data = None
-        # What the live forecast was conditioned on, captured at inference time
-        # rather than at save time so it stays correct if the data is refetched.
+        self.overlay_forecasts = []
+        self.is_processing = False
+        
+        # Model Caching State to prevent OOM/Bottlenecks
+        self.loaded_model = None
+        self.current_model_config = {}
+        self.validation_forecast_data = None
+        self.validation_metrics = []
+        self.validation_origin = None
+        self.validation_record_saved = False
+        # What the live forecast was conditioned on, captured at inference time.
         self.forecast_anchor = None
         self.forecast_target_col = None
         self.forecast_quantiles = None
@@ -65,12 +84,9 @@ class TimesFMApp:
         self.data_meta = {}
         self.backtest_thread = None
         self.backtest_stop = threading.Event()
-        self.overlay_forecasts = []
-        self.is_processing = False
-        
-        # Model Caching State to prevent OOM/Bottlenecks
-        self.loaded_model = None
-        self.current_model_config = {}
+        # These collections describe the fetched feature table and its UI selections.
+        self.feature_catalog = []
+        self.external_source_vars = {}
         
         self.root.columnconfigure(0, weight=0)
         self.root.columnconfigure(1, weight=1)
@@ -88,6 +104,10 @@ class TimesFMApp:
         except Exception as e:
             self.log_message(f"Database initialization failed: {str(e)}", "error")
 
+        # refresh_forecast_history now queries off-thread and populates on the UI
+        # thread. Calling it from a worker touched Tk widgets directly, and the
+        # log line read the tree before the worker had filled it, so it always
+        # reported 0 records.
         self.refresh_forecast_history()
         self.refresh_backtest_history()
 
@@ -100,11 +120,14 @@ class TimesFMApp:
         #Creating the tabs inside the parent notebook
         tab_inference = ttk.Frame(parent_notebook)
         tab_logs = ttk.Frame(parent_notebook)
+        tab_settings = ttk.Frame(parent_notebook)
+
         tab_backtest = ttk.Frame(parent_notebook)
 
         parent_notebook.add(tab_inference, text="Inference & Visualization")
         parent_notebook.add(tab_logs, text="System Logs")
         parent_notebook.add(tab_backtest, text="Backtest & Validation")
+        parent_notebook.add(tab_settings, text="Model Settings")
 
         # INFERENCE & VISUALIZATION TAB
         left_panel = ttk.Frame(tab_inference, width=350, padding=(10, 10, 10, 10))
@@ -122,30 +145,80 @@ class TimesFMApp:
         
         canvas.create_window((0, 0), window=self.settings_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def scroll_settings(event):
+            """Scroll the settings canvas when the pointer is over the first tab panel."""
+            event_widget = getattr(event, "widget", None)
+            while event_widget is not None and event_widget != canvas:
+                parent_name = event_widget.winfo_parent()
+                if not parent_name:
+                    return
+                event_widget = event_widget.nametowidget(parent_name)
+            if event_widget is None:
+                return
+
+            event_num = getattr(event, "num", None)
+            event_delta = getattr(event, "delta", 0)
+            if event_num == 4:
+                scroll_amount = -1
+            elif event_num == 5:
+                scroll_amount = 1
+            elif event_num == 6:
+                scroll_amount = -1
+            elif event_num == 7:
+                scroll_amount = 1
+            else:
+                scroll_amount = -1 if event_delta > 0 else 1
+            canvas.yview_scroll(scroll_amount, "units")
+            return "break"
+
+        # Tkinter reports macOS touchpad/wheel gestures as MouseWheel events.
+        # Buttons 4-7 are X11 scroll buttons: macOS and Windows Tk reject them
+        # outright with 'bad button number', which aborted setup_ui and stopped
+        # the app from starting at all. Bind them only where they exist.
+        WHEEL_SEQUENCES = ("<MouseWheel>", "<Shift-MouseWheel>", "<Option-MouseWheel>")
+        X11_SCROLL_SEQUENCES = ("<Button-4>", "<Button-5>", "<Button-6>", "<Button-7>")
+
+        def bind_wheel(widget, binder):
+            for sequence in WHEEL_SEQUENCES:
+                binder(widget, sequence)
+            if sys.platform.startswith("linux"):
+                for sequence in X11_SCROLL_SEQUENCES:
+                    try:
+                        binder(widget, sequence)
+                    except tk.TclError:
+                        pass
+
+        bind_wheel(canvas, lambda widget, sequence: widget.bind_all(sequence, scroll_settings))
+
+        def bind_settings_scroll(widget):
+            """Give nested settings controls a direct chance to handle touchpad events."""
+            bind_wheel(widget, lambda w, sequence: w.bind(sequence, scroll_settings, add="+"))
+            for child in widget.winfo_children():
+                bind_settings_scroll(child)
         
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
         # LOGS AND QC TAB: tab_logs
-        
         self.data_grid_frame = ttk.LabelFrame(tab_logs, text="Forecast History", padding=(10, 10, 10, 10))
         self.data_grid_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         ## DATA GRID and children
-        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "Target", "Anchor Date", "MAE", "MASE", "Dir %"), show="headings", selectmode="extended")
+        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Target", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "Anchor", "MAE", "MASE", "Dir %"), show="headings", selectmode="extended")
         self.run_tree.pack(fill="both", expand=True, side="left")
         self.run_tree.heading("ID", text="ID",)
         self.run_tree.heading("Timestamp", text="Timestamp")
         self.run_tree.heading("Ticker", text="Ticker")
+        self.run_tree.heading("Target", text="Target")
         self.run_tree.heading("Interval", text="Interval")
         self.run_tree.heading("Context Length", text="Context Length")
         self.run_tree.heading("Horizon Length", text="Horizon Length")
         self.run_tree.heading("Model Repo", text="Model Repo")
         self.run_tree.heading("Period", text="Period")
-        self.run_tree.heading("Target", text="Target")
-        self.run_tree.heading("Anchor Date", text="Anchor Date")
+        self.run_tree.heading("Anchor", text="Anchor Date")
         self.run_tree.heading("MAE", text="MAE")
-        # MASE is the column to read: < 1 beats a naive forecast, >= 1 does not.
+        # MASE is the column to read: < 1 beats a naive forecast.
         self.run_tree.heading("MASE", text="MASE (<1 = skill)")
         self.run_tree.heading("Dir %", text="Dir %")
 
@@ -158,13 +231,38 @@ class TimesFMApp:
         ### Configure treeview columns
         self.qc_controls_frame = ttk.LabelFrame(tab_logs, text="QC Controls")
         self.qc_controls_frame.pack(fill="x", pady=(0, 10), padx=10)
+
+        # TAB 3: MODEL MANAGER (THE ARMORY)
+        armory_frame = ttk.LabelFrame(tab_settings, text="Local Model Weights", padding=10)
+        armory_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.model_listbox = tk.Listbox(armory_frame, font=("Courier", 10))
+        self.model_listbox.pack(fill="both", expand=True, pady=(0, 10))
+
+        armory_btn_frame = ttk.Frame(armory_frame)
+        armory_btn_frame.pack(fill="x")
+
+        self.refresh_models_btn = ttk.Button(armory_btn_frame, text="Scan Local Folder", command=self.scan_local_models)
+        self.refresh_models_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.set_active_btn = ttk.Button(armory_btn_frame, text="Set Selected as Active Model", command=self.set_active_local_model)
+        self.set_active_btn.pack(side=tk.LEFT, padx=5)
+
+        download_frame = ttk.LabelFrame(tab_settings, text="Download New Model (HuggingFace)", padding=10)
+        download_frame.pack(fill="x", padx=10, pady=10)
+
+        ttk.Label(download_frame, text="HF Repo ID:").pack(side=tk.LEFT)
+        self.dl_repo_var = tk.StringVar(value="google/timesfm-1.0-200m-pytorch")
+        ttk.Entry(download_frame, textvariable=self.dl_repo_var, width=40).pack(side=tk.LEFT, padx=10)
         
-
-
+        self.download_btn = ttk.Button(download_frame, text="Download Model", command=self.thread_download_model)
+        self.download_btn.pack(side=tk.LEFT)
         
         self.build_data_settings()
         self.build_model_settings()
         self.build_action_buttons()
+        bind_settings_scroll(self.settings_frame)
+        self.scan_local_models() # Auto-populate listbox on boot
         
         right_panel = ttk.Frame(tab_inference, padding=(10, 10, 10, 10))
         right_panel.pack(side="right", fill="both", expand=True)
@@ -302,23 +400,17 @@ class TimesFMApp:
         return transforms.PRICE
 
     def _timesfm_model_fn(self, horizon):
-        """Wrap the already-loaded model in the backtest's model_fn contract."""
-        def _forecast(context, steps):
-            window = np.asarray(context, dtype=np.float32).reshape(-1)
-            if EVALUATOR_MODE == "timesfm3":
-                outputs = list(self.loaded_model.predict_batch(
-                    [window], horizon=steps, return_quantiles=True,
-                    use_symmetric_averaging=False))
-                point = np.asarray(outputs[0].forecast, dtype=float).reshape(-1)
-                raw = getattr(outputs[0], "quantiles", None)
-            else:
-                point_forecast, quantile_forecast = self.loaded_model.forecast(
-                    [window], freq=[self.freq_ind_var.get()])
-                point = np.asarray(point_forecast[0], dtype=float).reshape(-1)
-                raw = np.asarray(quantile_forecast)[0] if quantile_forecast is not None else None
+        """Wrap the already-loaded model in the backtest's model_fn contract.
 
-            spread = self._normalise_quantiles(raw, steps)
-            return point[:steps], (np.asarray(spread["values"]) if spread else None)
+        Covariates are passed as None: a walk-forward would have to re-slice
+        every covariate column at every origin to stay leak-free, which the
+        univariate path does not need.
+        """
+        def _forecast(context, steps):
+            point, spread = self._predict_loaded_model(
+                np.asarray(context, dtype=np.float32), None, steps, want_quantiles=True
+            )
+            return point, (np.asarray(spread["values"]) if spread else None)
         return _forecast
 
     def _run_backtest_job(self):
@@ -561,64 +653,76 @@ class TimesFMApp:
     def build_data_settings(self):
         data_frame = ttk.LabelFrame(self.settings_frame, text="1. Data Farming (yfinance)", padding=(10, 5))
         data_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
-        
         ttk.Label(data_frame, text="Ticker Symbol:").grid(row=0, column=0, sticky="w", pady=2)
         self.tkr_var = tk.StringVar(value="ASELS.IS")
         ttk.Entry(data_frame, textvariable=self.tkr_var, width=15).grid(row=0, column=1, sticky="w", pady=2)
-        
         ttk.Label(data_frame, text="Interval:").grid(row=1, column=0, sticky="w", pady=2)
         self.interval_var = tk.StringVar(value="1d")
         ttk.Combobox(data_frame, textvariable=self.interval_var, values=["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"], width=13, state="readonly").grid(row=1, column=1, sticky="w", pady=2)
-        
         ttk.Label(data_frame, text="Data Period:").grid(row=2, column=0, sticky="w", pady=2)
         self.period_var = tk.StringVar(value="max")
         ttk.Combobox(data_frame, textvariable=self.period_var, values=["1mo", "3mo", "6mo", "1y", "2y", "5y", "max"], width=13, state="readonly").grid(row=2, column=1, sticky="w", pady=2)
-        
         ttk.Label(data_frame, text="Target Column:").grid(row=3, column=0, sticky="w", pady=2)
         self.target_col_var = tk.StringVar(value="Close")
-        ttk.Combobox(data_frame, textvariable=self.target_col_var, values=["Open", "High", "Low", "Close", "Adj Close", "Volume"], width=13, state="readonly").grid(row=3, column=1, sticky="w", pady=2)
+        ttk.Combobox(data_frame, textvariable=self.target_col_var, values=["Open", "High", "Low", "Close", "Volume"], width=13, state="readonly").grid(row=3, column=1, sticky="w", pady=2)
 
-        # Adjusted closes embed dividends and splits announced AFTER the bar.
-        # Fine looking forward, look-ahead in a backtest, so make it a choice.
+        features_frame = ttk.LabelFrame(self.settings_frame, text="2. Features and External Series", padding=(10, 5))
+        features_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
+        ttk.Label(features_frame, text="Additional sources (aligned to the market dates):").pack(anchor="w")
+        self.external_sources = {
+            "Crude oil (WTI)": ("yahoo", "CL=F"), "Brent crude oil": ("yahoo", "BZ=F"),
+            "USD/TRY exchange rate": ("yahoo", "USDTRY=X"), "EUR/USD exchange rate": ("yahoo", "EURUSD=X"),
+            "US federal funds rate": ("fred", "DFF"), "US 10-year treasury rate": ("fred", "DGS10"),
+        }
+        for label in self.external_sources:
+            variable = tk.BooleanVar(value=False)
+            self.external_source_vars[label] = variable
+            ttk.Checkbutton(features_frame, text=label, variable=variable).pack(anchor="w")
+        ttk.Label(features_frame, text="Custom sources (yahoo:SYMBOL or fred:SERIES_ID, comma-separated):").pack(anchor="w", pady=(4, 0))
+        self.custom_source_var = tk.StringVar()
+        ttk.Entry(features_frame, textvariable=self.custom_source_var, width=34).pack(fill=tk.X)
+        # Adjusted closes fold in dividends and splits announced AFTER the bar.
+        # Fine forward, look-ahead in a backtest, so make it an explicit choice.
         self.adjusted_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(data_frame, text="Adjusted prices (uncheck to backtest)",
-                        variable=self.adjusted_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
-
+        ttk.Checkbutton(features_frame, text="Adjusted prices (uncheck to backtest)",
+                        variable=self.adjusted_var).pack(anchor="w", pady=(6, 0))
         self.force_refresh_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(data_frame, text="Bypass local cache",
-                        variable=self.force_refresh_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Checkbutton(features_frame, text="Bypass local cache",
+                        variable=self.force_refresh_var).pack(anchor="w")
+
+        ttk.Label(features_frame, text="Model covariates (select after fetching):").pack(anchor="w", pady=(6, 0))
+        self.feature_listbox = tk.Listbox(features_frame, height=8, selectmode=tk.MULTIPLE, exportselection=False)
+        self.feature_listbox.pack(fill=tk.X, pady=(2, 0))
 
     def build_model_settings(self):
         model_frame = ttk.LabelFrame(self.settings_frame, text="2. TimesFM 3.0 Configuration", padding=(10, 5))
         model_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
-        
-        ttk.Label(model_frame, text="HuggingFace Repo ID:").grid(row=0, column=0, columnspan=2, sticky="w", pady=(2,0))
+        ttk.Label(model_frame, text="HuggingFace Repo ID:").grid(row=0, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self.repo_var = tk.StringVar(value="google/timesfm-3.0-pytorch")
-        ttk.Entry(model_frame, textvariable=self.repo_var, width=32).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0,5))
-        
+        ttk.Entry(model_frame, textvariable=self.repo_var, width=32).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 5))
         ttk.Label(model_frame, text="Context Length (Input):").grid(row=2, column=0, sticky="w", pady=2)
         self.context_len_var = tk.IntVar(value=1056)
         ttk.Entry(model_frame, textvariable=self.context_len_var, width=10).grid(row=2, column=1, sticky="e", pady=2)
-        
         ttk.Label(model_frame, text="Horizon Length (Output):").grid(row=3, column=0, sticky="w", pady=2)
         self.horizon_var = tk.IntVar(value=7)
         ttk.Entry(model_frame, textvariable=self.horizon_var, width=10).grid(row=3, column=1, sticky="e", pady=2)
-        
-        ttk.Label(model_frame, text="Compute Backend:").grid(row=4, column=0, sticky="w", pady=2)
-        self.backend_var = tk.StringVar(value="gpu")
-        ttk.Combobox(model_frame, textvariable=self.backend_var, values=["cpu", "gpu", "tpu"], width=8, state="readonly").grid(row=4, column=1, sticky="e", pady=2)
-        
-        ttk.Label(model_frame, text="Freq Indicator (0=High, 1=Min...):").grid(row=5, column=0, sticky="w", pady=2)
-        self.freq_ind_var = tk.IntVar(value=0)
-        ttk.Entry(model_frame, textvariable=self.freq_ind_var, width=10).grid(row=5, column=1, sticky="e", pady=2)
+        ttk.Label(model_frame, text="Validation Ratio (0.05-0.5):").grid(row=4, column=0, sticky="w", pady=2)
+        self.validation_ratio_var = tk.DoubleVar(value=0.2)
+        ttk.Entry(model_frame, textvariable=self.validation_ratio_var, width=10).grid(row=4, column=1, sticky="e", pady=2)
 
-        # Modelling levels makes the model track the trend and contaminates
-        # MASE with drift. Returns are stationary and are what a trade depends on.
-        ttk.Label(model_frame, text="Model in:").grid(row=6, column=0, sticky="w", pady=2)
-        self.target_space_var = tk.StringVar(value=transforms.SPACE_LABELS[transforms.LOG_RETURN])
+        # Levels make the model track trend and contaminate MASE with drift.
+        # Returns are stationary and are what a trade actually depends on.
+        ttk.Label(model_frame, text="Model in:").grid(row=9, column=0, sticky="w", pady=2)
+        self.target_space_var = tk.StringVar(value=transforms.SPACE_LABELS[transforms.PRICE])
         ttk.Combobox(model_frame, textvariable=self.target_space_var,
-                     values=[transforms.SPACE_LABELS[space] for space in transforms.TARGET_SPACES],
-                     width=14, state="readonly").grid(row=6, column=1, sticky="e", pady=2)
+                     values=[transforms.SPACE_LABELS[sp] for sp in transforms.TARGET_SPACES],
+                     width=14, state="readonly").grid(row=9, column=1, sticky="e", pady=2)
+        ttk.Label(model_frame, text="Compute Backend:").grid(row=5, column=0, sticky="w", pady=2)
+        self.backend_var = tk.StringVar(value="gpu")
+        ttk.Combobox(model_frame, textvariable=self.backend_var, values=["cpu", "gpu", "tpu"], width=8, state="readonly").grid(row=5, column=1, sticky="e", pady=2)
+        ttk.Label(model_frame, text="Freq Indicator (0=High, 1=Min...):").grid(row=6, column=0, sticky="w", pady=2)
+        self.freq_ind_var = tk.IntVar(value=0)
+        ttk.Entry(model_frame, textvariable=self.freq_ind_var, width=10).grid(row=6, column=1, sticky="e", pady=2)
 
     def build_action_buttons(self):
 
@@ -677,13 +781,13 @@ class TimesFMApp:
         formatted_msg = f"[{timestamp}] {prefix}{message}\n"
 
         self.log_text.config(state='normal')
-        # Levels were accepted but ignored, so warnings and errors were
-        # indistinguishable from ordinary chatter.
+        # The level argument was accepted but ignored, so warnings and errors
+        # were indistinguishable from ordinary chatter.
         self.log_text.insert(tk.END, formatted_msg, level if level in ("warning", "error") else ())
         self.log_text.see(tk.END)
         self.log_text.config(state='disabled')
-        # No update_idletasks() here: log_message runs inside after() callbacks,
-        # and pumping the event loop from one invites re-entrant redraws.
+        # No update_idletasks(): this runs inside after() callbacks, and pumping
+        # the event loop from one invites re-entrant redraws.
 
     def set_processing_state(self, state):
         self.is_processing = state
@@ -698,50 +802,307 @@ class TimesFMApp:
         threading.Thread(target=self._fetch_data_job, daemon=True).start()
 
     def _fetch_data_job(self):
+        """Fetch raw market data, then add local and external feature series."""
+        """Fetch market data, enrich it, and align any requested external series."""
         try:
             ticker = self.tkr_var.get().strip().upper()
             period = self.period_var.get()
             interval = self.interval_var.get()
 
-            # Served from the local cache when it is fresh. Beyond saving a
-            # round trip, this is what makes a backtest reproducible: yfinance
-            # revises history, so re-downloading moves the target.
+            # Served locally when fresh. Beyond saving a round trip this is what
+            # makes a backtest reproducible: yfinance revises history.
             data, meta = data_cache.get_ohlcv(
                 ticker, period, interval,
                 adjusted=self.adjusted_var.get(),
                 force_refresh=self.force_refresh_var.get(),
             )
+            self.data_meta = meta
 
             if data.empty:
                 raise ValueError(f"No data returned for ticker {ticker}.")
 
-            self.historical_data = data
-            self.data_meta = meta
+            self.historical_data = self._add_engineered_features(data)
+            self._fetch_external_series()
             self.root.after(0, self._on_fetch_success)
         except Exception as e:
             self.root.after(0, self._on_process_error, str(e))
 
     def _on_fetch_success(self):
-        meta = getattr(self, "data_meta", {}) or {}
-        origin = meta.get("source", "download")
-        detail = f" (from {origin}"
-        if origin == "cache":
-            detail += f", {meta.get('age_hours', 0)}h old"
-        detail += f", {'adjusted' if meta.get('adjusted') else 'raw'} prices)"
-        self.log_message(f"Successfully fetched {len(self.historical_data)} data points{detail}.")
+        self._refresh_feature_controls()
+        meta = self.data_meta or {}
+        detail = f" (from {meta.get('source', 'download')}, {'adjusted' if meta.get('adjusted') else 'raw'} prices)"
+        self.log_message(f"Successfully fetched {len(self.historical_data)} rows and {len(self.historical_data.columns)} usable features{detail}.")
         if not meta.get("adjusted", True):
-            self.log_message("Raw prices in use: correct for backtesting, but splits will show as jumps.", "warning")
+            self.log_message("Raw prices in use: correct for backtesting, but splits show as jumps.", "warning")
         self.overlay_forecasts.clear()
-        # The live forecast belongs to the series it was run against. Keeping it
-        # after a refetch left a stale curve on the chart with no way to tell.
+        # A refetch invalidates a forecast drawn against the previous series.
         if self.forecast_data is not None:
             self.forecast_data = None
             self.forecast_anchor = None
-            self.forecast_target_col = None
             self.forecast_quantiles = None
             self.log_message("Cleared the previous forecast; re-run it against the new data.", "warning")
         self.update_plot()
         self.set_processing_state(False)
+
+    def _add_engineered_features(self, data):
+        """Create common technical indicators while retaining the raw OHLCV columns.
+
+        Indicators are calculated locally from the downloaded market data so the
+        model receives a reproducible feature table rather than provider-specific
+        indicator fields.
+        """
+        data = data.copy()
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        data = data.loc[:, ~data.columns.duplicated()]
+        close = pd.to_numeric(data.get("Close"), errors="coerce")
+        high = pd.to_numeric(data.get("High", close), errors="coerce")
+        low = pd.to_numeric(data.get("Low", close), errors="coerce")
+        volume = pd.to_numeric(data.get("Volume"), errors="coerce")
+        if close is None or close.dropna().empty:
+            raise ValueError("The downloaded data does not contain a usable Close series.")
+
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        data["RSI_14"] = 100 - (100 / (1 + rs))
+        data["EMA_12"] = close.ewm(span=12, adjust=False).mean()
+        data["EMA_26"] = close.ewm(span=26, adjust=False).mean()
+        data["MACD"] = data["EMA_12"] - data["EMA_26"]
+        data["MACD_Signal"] = data["MACD"].ewm(span=9, adjust=False).mean()
+        data["SMA_20"] = close.rolling(20, min_periods=20).mean()
+        data["Bollinger_Middle"] = data["SMA_20"]
+        rolling_std = close.rolling(20, min_periods=20).std()
+        data["Bollinger_Upper"] = data["SMA_20"] + 2 * rolling_std
+        data["Bollinger_Lower"] = data["SMA_20"] - 2 * rolling_std
+        true_range = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        data["ATR_14"] = true_range.rolling(14, min_periods=14).mean()
+        lowest_low = low.rolling(14, min_periods=14).min()
+        highest_high = high.rolling(14, min_periods=14).max()
+        data["Stochastic_K"] = 100 * (close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
+        data["Return_1D"] = close.pct_change()
+        data["Volatility_20D"] = data["Return_1D"].rolling(20, min_periods=20).std()
+        if volume is not None and not volume.dropna().empty:
+            data["OBV"] = (np.sign(close.diff()).fillna(0) * volume.fillna(0)).cumsum()
+        return data
+
+    def _fetch_external_series(self):
+        """Fetch optional Yahoo/FRED series and align them to the market index.
+
+        Forward filling is appropriate for lower-frequency macro data. The final
+        backward fill only handles leading gaps where the selected series starts
+        after the requested market history begins.
+        """
+        selected = [label for label, variable in self.external_source_vars.items() if variable.get()]
+        custom_sources = [item.strip() for item in self.custom_source_var.get().split(",") if item.strip()]
+        for item in custom_sources:
+            try:
+                source_type, symbol = item.split(":", 1)
+                if source_type.lower() not in {"yahoo", "fred"} or not symbol:
+                    raise ValueError
+                label = f"{source_type.lower()}:{symbol}"
+                self.external_sources[label] = (source_type.lower(), symbol)
+                selected.append(label)
+            except ValueError:
+                raise ValueError(f"Invalid custom source '{item}'. Use yahoo:SYMBOL or fred:SERIES_ID.")
+        if not selected:
+            return
+        market_index = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
+        if market_index.tz is not None:
+            market_index = market_index.tz_localize(None)
+        for label in selected:
+            source_type, symbol = self.external_sources[label]
+            if source_type == "yahoo":
+                series = yf.download(symbol, period=self.period_var.get(), interval=self.interval_var.get(), progress=False, timeout=10)
+                if isinstance(series.columns, pd.MultiIndex):
+                    series.columns = series.columns.get_level_values(0)
+                series = series["Close"]
+            else:
+                url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={quote(symbol)}"
+                series = pd.read_csv(url, index_col=0, parse_dates=True)[symbol]
+            series.index = pd.DatetimeIndex(pd.to_datetime(series.index)).tz_localize(None)
+            aligned = pd.Series(series, index=series.index).reindex(market_index).ffill().bfill()
+            self.historical_data[label] = aligned.to_numpy()
+
+    def _refresh_feature_controls(self):
+        """Refresh target and covariate choices after the feature table changes."""
+        target_values = list(self.historical_data.columns)
+        self.feature_catalog = [column for column in target_values if column != self.target_col_var.get()]
+        self.feature_listbox.delete(0, tk.END)
+        for column in self.feature_catalog:
+            self.feature_listbox.insert(tk.END, column)
+        for child in self.settings_frame.winfo_children():
+            for widget in child.winfo_children():
+                if isinstance(widget, ttk.Combobox) and widget.cget("textvariable") == str(self.target_col_var):
+                    widget.configure(values=target_values)
+        if self.target_col_var.get() not in target_values:
+            self.target_col_var.set("Close" if "Close" in target_values else target_values[0])
+
+    def _selected_covariates(self):
+        """Return the feature names selected for TimesFM historical covariates."""
+        return [self.feature_listbox.get(index) for index in self.feature_listbox.curselection()]
+
+    def _prepare_context(self, values, end_index, context_len):
+        """Return a finite, patch-sized target context ending at ``end_index``."""
+        context = np.asarray(values[:end_index], dtype=np.float32)
+        if context.size == 0:
+            raise ValueError("The validation training partition is empty.")
+        if context.size < context_len:
+            context = np.pad(context, (context_len - context.size, 0), mode="edge")
+        return context[-context_len:]
+
+    def _prepare_covariate_context(self, end_index, context_len, selected_covariates):
+        """Prepare historical-only covariates with the same time axis as the target."""
+        covariate_context = []
+        for column in selected_covariates:
+            values = pd.to_numeric(self.historical_data[column], errors="coerce").to_numpy(dtype=float)
+            values = values[:end_index]
+            if not np.isfinite(values).any():
+                continue
+            values = pd.Series(values).interpolate(limit_direction="both").ffill().bfill().to_numpy()
+            if len(values) < context_len:
+                values = np.pad(values, (context_len - len(values), 0), mode="edge")
+            covariate_context.append(values[-context_len:])
+        return np.asarray(covariate_context, dtype=np.float32) if covariate_context else None
+
+    def _predict_loaded_model(self, input_context, covariate_array, horizon,
+                              want_quantiles=False):
+        """Run one prediction and normalise its output.
+
+        Returns the point forecast, or (point, quantiles) when asked. The
+        quantile spread was previously requested as False and discarded; it is
+        the most useful thing the model produces.
+        """
+        input_context = np.asarray(input_context, dtype=np.float32)
+        raw_quantiles = None
+        if EVALUATOR_MODE == "timesfm3":
+            outputs = list(self.loaded_model.predict_batch(
+                [input_context],
+                horizon=horizon,
+                past_only_covariates=[covariate_array],
+                return_quantiles=True,
+                use_symmetric_averaging=False,
+                univariate=False,
+            ))
+            result = outputs[0].forecast
+            raw_quantiles = getattr(outputs[0], "quantiles", None)
+        else:
+            point_forecast, quantile_forecast = self.loaded_model.forecast(
+                [input_context], freq=[self.freq_ind_var.get()]
+            )
+            result = point_forecast[0]
+            # Legacy timesfm returns [batch, horizon, 10]: column 0 is the mean,
+            # 1..9 are deciles. This was being thrown away as `_`.
+            if quantile_forecast is not None:
+                raw_quantiles = np.asarray(quantile_forecast)[0]
+
+        point = np.asarray(result, dtype=float).reshape(-1)[:horizon]
+        if not want_quantiles:
+            return point
+        return point, self._normalise_quantiles(raw_quantiles, horizon)
+
+    def _selected_space(self):
+        label = self.target_space_var.get()
+        for space, text in transforms.SPACE_LABELS.items():
+            if text == label:
+                return space
+        return transforms.PRICE
+
+    @staticmethod
+    def _normalise_quantiles(raw, horizon):
+        """Coerce whatever the backend returned into {levels, values}.
+
+        The evaluator paths disagree on shape and neither documents it firmly,
+        so anything unrecognised degrades to no quantiles rather than crashing
+        mid-forecast.
+        """
+        if raw is None:
+            return None
+        try:
+            matrix = np.asarray(raw, dtype=float)
+        except (TypeError, ValueError):
+            return None
+
+        if matrix.ndim == 3 and matrix.shape[0] == 1:
+            matrix = matrix[0]
+        if matrix.ndim != 2:
+            return None
+        if matrix.shape[0] != horizon and matrix.shape[1] == horizon:
+            matrix = matrix.T
+        if matrix.shape[0] != horizon:
+            return None
+
+        width = matrix.shape[1]
+        if width == 10:
+            matrix = matrix[:, 1:]          # column 0 is the mean, not a quantile
+            levels = [round(0.1 * i, 1) for i in range(1, 10)]
+        elif width == 9:
+            levels = [round(0.1 * i, 1) for i in range(1, 10)]
+        else:
+            levels = [round((i + 1) / (width + 1), 4) for i in range(width)]
+
+        if not np.isfinite(matrix).all():
+            return None
+        matrix = np.sort(matrix, axis=1)     # quantiles must not cross
+        return {"levels": levels, "values": matrix.tolist()}
+
+    @staticmethod
+    def _fmt(value, spec=".3f", scale=1.0, suffix=""):
+        if value is None:
+            return "-"
+        try:
+            number = float(value) * scale
+        except (TypeError, ValueError):
+            return "-"
+        return "-" if number != number else format(number, spec) + suffix
+
+    def _calculate_validation_metrics(self, actual, predicted, baseline):
+        """Return common accuracy metrics as a list of ``(name, value)`` tuples."""
+        actual = np.asarray(actual, dtype=float).reshape(-1)
+        predicted = np.asarray(predicted, dtype=float).reshape(-1)
+        length = min(actual.size, predicted.size)
+        actual = actual[:length]
+        predicted = predicted[:length]
+        valid = np.isfinite(actual) & np.isfinite(predicted)
+        actual = actual[valid]
+        predicted = predicted[valid]
+        if actual.size == 0:
+            return []
+
+        error = predicted - actual
+        absolute_error = np.abs(error)
+        denominator = np.maximum(np.abs(actual), np.finfo(float).eps)
+        smape_denominator = np.maximum(np.abs(actual) + np.abs(predicted), np.finfo(float).eps)
+        ss_total = np.sum((actual - np.mean(actual)) ** 2)
+        r_squared = 1.0 - np.sum(error ** 2) / ss_total if ss_total > 0 else float("nan")
+        if actual.size > 1:
+            actual_direction = np.sign(np.diff(np.concatenate(([baseline], actual))))
+            predicted_direction = np.sign(np.diff(np.concatenate(([baseline], predicted))))
+            # Score only steps where both sides have a direction: a flat
+            # forecast expresses no view, and counting it wrong reports a naive
+            # baseline as 0% accurate.
+            scored = (actual_direction != 0) & (predicted_direction != 0)
+            directional_accuracy = (
+                float(np.mean(actual_direction[scored] == predicted_direction[scored]))
+                if scored.any() else float("nan")
+            )
+        else:
+            directional_accuracy = float("nan")
+        # MAE alone cannot say whether the forecast beat "no change", so report
+        # it against that baseline explicitly. MASE < 1 means real skill.
+        naive_mae = float(np.mean(np.abs(actual - baseline)))
+        skill = 1.0 - float(np.mean(absolute_error)) / naive_mae if naive_mae > 0 else float("nan")
+        return [
+            ("MAE", float(np.mean(absolute_error))),
+            ("NaiveMAE", naive_mae),
+            ("SkillVsNaive", skill),
+            ("RMSE", float(np.sqrt(np.mean(error ** 2)))),
+            ("MAPE", float(np.mean(absolute_error / denominator) * 100)),
+            ("sMAPE", float(np.mean(2 * absolute_error / smape_denominator) * 100)),
+            ("R2", float(r_squared)),
+            ("DirectionalAccuracy", directional_accuracy),
+        ]
 
     def thread_run_forecast(self):
         if self.is_processing: return
@@ -754,41 +1115,40 @@ class TimesFMApp:
         threading.Thread(target=self._run_forecast_job, daemon=True).start()
 
     def _run_forecast_job(self):
+        """Prepare the TimesFM input contract and execute the selected model API.
+
+        The target is a one-dimensional context. TimesFM 3 can additionally
+        receive historical covariates in ``[feature_count, time_steps]`` form.
+        """
         try:
             target_col = self.target_col_var.get()
             if target_col not in self.historical_data.columns:
                 raise ValueError(f"Column '{target_col}' not found in fetched data.")
                 
-            time_series = self.historical_data[target_col].values
+            time_series = pd.to_numeric(self.historical_data[target_col], errors="coerce").to_numpy(dtype=float)
             
             if np.isnan(time_series).all():
                 raise ValueError(f"The column '{target_col}' contains only invalid/NaN data.")
-
+            
             gaps = int(np.isnan(time_series).sum())
             if gaps:
-                # Carry the last observed price across gaps (and back-fill any
-                # leading ones). Imputing the series mean, as this used to do,
-                # injects prices that never traded anywhere near those dates.
+                # Carry the last observed price across gaps. Imputing the series
+                # mean injects prices that never traded near those dates.
                 time_series = pd.Series(time_series).ffill().bfill().to_numpy()
                 self.root.after(0, self.log_message,
                                 f"Filled {gaps} missing value(s) in '{target_col}' by carrying prices forward.",
                                 "warning")
             
-            # Move to the modelling space before anything is sliced or padded,
-            # so the context length is counted in the units the model sees.
-            space = self._selected_space()
-            price_series = time_series
-            if space != transforms.PRICE:
-                time_series = transforms.encode(price_series, space)
-                self.root.after(0, self.log_message,
-                                f"Modelling {transforms.SPACE_LABELS[space].lower()} "
-                                f"({time_series.size} observations after differencing).")
-
             context_len = self.context_len_var.get()
             horizon = self.horizon_var.get()
-
+            validation_ratio = float(self.validation_ratio_var.get())
+            
             if context_len <= 0:
                 raise ValueError("Context length must be strictly greater than 0.")
+            if horizon <= 0:
+                raise ValueError("Horizon length must be strictly greater than 0.")
+            if not 0.05 <= validation_ratio <= 0.5:
+                raise ValueError("Validation ratio must be between 0.05 and 0.5.")
                 
             # FORCE CONTEXT LENGTH TO BE A MULTIPLE OF INPUT_PATCH_LEN (32) TO PREVENT TENSOR SHAPE MISMATCH
             input_patch_len = 32
@@ -802,8 +1162,31 @@ class TimesFMApp:
                 pad_size = context_len - len(time_series)
                 time_series = np.pad(time_series, (pad_size, 0), mode='edge')
 
-            input_context = time_series[-context_len:]
-            forecast_input = [input_context]
+            selected_covariates = self._selected_covariates()
+
+            # Return space is only safe without covariates: differencing drops
+            # the first observation, which would shift the target one bar
+            # relative to covariate columns and silently misalign them.
+            space = self._selected_space()
+            if space != transforms.PRICE and selected_covariates:
+                space = transforms.PRICE
+                self.root.after(0, self.log_message,
+                                "Covariates are selected, so modelling stays in price space "
+                                "(differencing would misalign the covariate columns by one bar).",
+                                "warning")
+            price_series = time_series
+            if space != transforms.PRICE:
+                time_series = transforms.encode(price_series, space)
+                self.root.after(0, self.log_message,
+                                f"Modelling {transforms.SPACE_LABELS[space].lower()} "
+                                f"({time_series.size} observations after differencing).")
+
+            input_context = self._prepare_context(time_series, len(time_series), context_len)
+            covariate_array = self._prepare_covariate_context(
+                len(time_series), context_len, selected_covariates
+            )
+            # TimesFM 3 expects one target context and optional covariates as
+            # [feature_count, time_steps]; future values are intentionally unknown.
             
             if not TIMESFM_AVAILABLE:
                 raise ImportError("timesfm library is not available. Cannot run forecast.")
@@ -816,8 +1199,7 @@ class TimesFMApp:
             }
             if EVALUATOR_MODE != "timesfm3":
                 # Only the legacy constructor bakes these in. Keying on them in
-                # timesfm3 mode forced a full reload whenever the horizon moved,
-                # even though ModelConfig never sees them.
+                # timesfm3 mode forced a reload whenever the horizon moved.
                 current_request_config["context_len"] = context_len
                 current_request_config["horizon"] = horizon
             
@@ -825,6 +1207,7 @@ class TimesFMApp:
                 self.root.after(0, self.log_message, f"Hardware loading TimesFM Model from {current_request_config['repo']} (this takes time)...")
                 
                 device_target = current_request_config["backend"]
+                import sys
                 if sys.platform == "darwin" and device_target == "gpu":
                     device_target = "mps"
                     self.root.after(0, self.log_message, "macOS detected: Mapped GPU to Apple MPS.")
@@ -854,59 +1237,60 @@ class TimesFMApp:
                 self.root.after(0, self.log_message, "Using cached model weights in VRAM/RAM...")
             
             self.root.after(0, self.log_message, "Running inference on prepared context data...")
-            
-            # Run the actual prediction
-            input_context = input_context.astype(np.float32)
-            
-            raw_quantiles = None
-            if EVALUATOR_MODE == "timesfm3":
-                # TimesFM 3.0 uses predict_batch instead of forecast
-                outputs = list(self.loaded_model.predict_batch(
-                    [input_context],
-                    horizon=horizon,
-                    # Was False, which threw away the single most useful thing
-                    # the model produces: its uncertainty.
-                    return_quantiles=True,
-                    use_symmetric_averaging=False
-                ))
-                forecast_result = outputs[0].forecast
-                raw_quantiles = getattr(outputs[0], "quantiles", None)
-            else:
-                freq_ind = [self.freq_ind_var.get()]
-                point_forecast, quantile_forecast = self.loaded_model.forecast(
-                    [input_context], freq=freq_ind
-                )
-                forecast_result = point_forecast[0]
-                # Legacy timesfm returns [batch, horizon, 10]: column 0 is the
-                # mean, columns 1..9 are deciles. This used to be discarded.
-                if quantile_forecast is not None:
-                    raw_quantiles = np.asarray(quantile_forecast)[0]
 
-            spread = self._normalise_quantiles(raw_quantiles, horizon)
+            validation_size = max(1, int(np.ceil(len(time_series) * validation_ratio)))
+            split_index = len(time_series) - validation_size
+            if split_index <= 0:
+                raise ValueError("Validation ratio leaves no training observations.")
+            validation_horizon = min(horizon, validation_size)
+            validation_context = self._prepare_context(time_series, split_index, context_len)
+            validation_covariates = self._prepare_covariate_context(
+                split_index, context_len, selected_covariates
+            )
+            validation_prediction = self._predict_loaded_model(
+                validation_context, validation_covariates, validation_horizon
+            )
+            validation_actual = time_series[split_index:split_index + validation_horizon]
+            self.validation_forecast_data = validation_prediction
+            self.validation_metrics = self._calculate_validation_metrics(
+                validation_actual,
+                validation_prediction,
+                time_series[split_index - 1],
+            )
+            self.validation_origin = pd.Timestamp(self.historical_data.index[split_index - 1]).isoformat()
+            self.validation_record_saved = False
+            self.root.after(
+                0,
+                self.log_message,
+                "Validation metrics: " + ", ".join(
+                    f"{name}={value:.4f}" for name, value in self.validation_metrics
+                    if np.isfinite(value)
+                ),
+            )
+
+            # The real forecast uses the full historical context after validation.
+            forecast_result, spread = self._predict_loaded_model(
+                input_context, covariate_array, horizon, want_quantiles=True
+            )
             if spread:
                 self.root.after(0, self.log_message,
                                 f"Captured {len(spread['levels'])} quantile levels.")
 
             # Reconstruct a price path so the plot, the CSV and every saved
-            # score stay in price space no matter what was modelled.
+            # score stay in price space regardless of what was modelled.
             if space != transforms.PRICE:
                 anchor_price = float(price_series[-1])
-                forecast_result = transforms.decode(
-                    np.asarray(forecast_result, dtype=float).reshape(-1), anchor_price, space)
+                forecast_result = transforms.decode(forecast_result, anchor_price, space)
                 if spread:
                     matrix = np.asarray(spread["values"], dtype=float)
-                    spread = {
-                        "levels": spread["levels"],
-                        # Each quantile path compounds on its own.
-                        "values": np.column_stack([
-                            transforms.decode(matrix[:, i], anchor_price, space)
-                            for i in range(matrix.shape[1])
-                        ]).tolist(),
-                    }
+                    spread = {"levels": spread["levels"], "values": np.column_stack([
+                        transforms.decode(matrix[:, i], anchor_price, space)
+                        for i in range(matrix.shape[1])
+                    ]).tolist()}
 
+            self.forecast_data = forecast_result
             self.forecast_quantiles = spread
             self.forecast_space = space
-            self.forecast_data = forecast_result
             self.forecast_anchor = self.historical_data.index[-1]
             self.forecast_target_col = target_col
 
@@ -928,6 +1312,15 @@ class TimesFMApp:
             return
 
         try:
+            # Persist the feature recipe with the forecast so later evaluation can
+            # identify the target series that was actually forecast.
+            anchor = self.forecast_anchor
+            if anchor is None:
+                anchor = self.historical_data.index[-1]
+            anchor = pd.Timestamp(anchor)
+            if anchor.tzinfo is not None:
+                anchor = anchor.tz_localize(None)
+
             db_manager.insert_forecast(
                 ticker=self.tkr_var.get().strip().upper(),
                 interval=self.interval_var.get(),
@@ -935,100 +1328,45 @@ class TimesFMApp:
                 horizon_length=self.horizon_var.get(),
                 model_repo=self.repo_var.get(),
                 period=self.period_var.get(),
-                forecast_data=np.asarray(self.forecast_data, dtype=float).reshape(-1).tolist(),
-                mae_score=None,  # Filled in later by calculate_mae_for_selected
                 target_column=self.forecast_target_col or self.target_col_var.get(),
-                anchor_date=self._anchor_to_iso(self.forecast_anchor),
+                forecast_data=np.asarray(self.forecast_data, dtype=float).reshape(-1).tolist(),
+                mae_score=None,
+                anchor_date=anchor.isoformat(),
                 quantiles=self.forecast_quantiles,
             )
             self.log_message("Forecast results saved to database successfully.")
+
+            # The validation row is no longer persisted: the schema has no
+            # forecast_type column to tell it apart from the real forecast, so
+            # storing it would produce two indistinguishable rows. Its metrics
+            # are reported here instead.
+            if self.validation_metrics:
+                self.log_message(
+                    "Validation (not persisted): " + ", ".join(
+                        f"{name}={value:.4f}" for name, value in self.validation_metrics
+                        if np.isfinite(value)
+                    ), "warning"
+                )
+            if self._selected_covariates():
+                self.log_message(
+                    f"Covariates used but not recorded: {', '.join(self._selected_covariates())} "
+                    "(schema has no feature_columns column).", "warning"
+                )
             self.refresh_forecast_history()
         except Exception as db_e:
             self.log_message(f"Database save failed: {str(db_e)}", "error")
 
-    def _selected_space(self):
-        """Map the combobox label back to a transforms constant."""
-        label = self.target_space_var.get()
-        for space, text in transforms.SPACE_LABELS.items():
-            if text == label:
-                return space
-        return transforms.PRICE
-
-    @staticmethod
-    def _normalise_quantiles(raw, horizon):
-        """Coerce whatever the backend returned into {levels, values}.
-
-        The two evaluator paths disagree on shape and neither documents it
-        firmly, so this is deliberately defensive: anything unrecognised
-        degrades to no quantiles rather than a crash mid-forecast.
-        """
-        if raw is None:
-            return None
-        try:
-            matrix = np.asarray(raw, dtype=float)
-        except (TypeError, ValueError):
-            return None
-
-        if matrix.ndim == 3 and matrix.shape[0] == 1:
-            matrix = matrix[0]
-        if matrix.ndim != 2:
-            return None
-        if matrix.shape[0] != horizon and matrix.shape[1] == horizon:
-            matrix = matrix.T
-        if matrix.shape[0] != horizon:
-            return None
-
-        width = matrix.shape[1]
-        if width == 10:
-            # column 0 is the mean, not a quantile
-            matrix = matrix[:, 1:]
-            levels = [round(0.1 * i, 1) for i in range(1, 10)]
-        elif width == 9:
-            levels = [round(0.1 * i, 1) for i in range(1, 10)]
-        else:
-            levels = [round((i + 1) / (width + 1), 4) for i in range(width)]
-
-        if not np.isfinite(matrix).all():
-            return None
-        # Quantiles must not cross; models occasionally emit them unsorted.
-        matrix = np.sort(matrix, axis=1)
-        return {"levels": levels, "values": matrix.tolist()}
-
-    @staticmethod
-    def _anchor_to_iso(anchor):
-        """Normalise a forecast anchor to a timezone-naive ISO string."""
-        if anchor is None:
-            return None
-        anchor = pd.Timestamp(anchor)
-        if anchor.tzinfo is not None:
-            anchor = anchor.tz_localize(None)
-        return anchor.isoformat()
-
-    def _actuals_series(self, target_column):
-        """Loaded history as a tz-naive Series, or None if unusable."""
-        if self.historical_data is None or self.historical_data.empty:
-            return None
-        if target_column not in self.historical_data.columns:
-            return None
-
-        dates = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
-        if dates.tz is not None:
-            dates = dates.tz_localize(None)
-
-        values = np.asarray(self.historical_data[target_column], dtype=float).reshape(-1)
-        series = pd.Series(values, index=dates)
-        return series[~series.index.duplicated(keep="last")]
-
     def _on_process_error(self, error_msg):
-        self.log_message(str(error_msg), "error")
-        # The dialog used to carry the whole traceback, which pushed the actual
-        # message off screen. The log keeps the full text.
-        headline = str(error_msg).strip().splitlines()[0] if str(error_msg).strip() else "Unknown error"
-        messagebox.showerror("Process Error", headline)
+        self.log_message(f"ERROR: {error_msg}")
+        messagebox.showerror("Process Error", str(error_msg))
         self.set_processing_state(False)
 
     def _get_forecast_dates(self, last_date, interval, length):
-        """Return timezone-naive dates immediately after the historical data."""
+        """Return timezone-naive dates immediately after the historical data.
+
+        Daily predictions use business days; intraday, weekly, and monthly
+        predictions use the interval-specific offsets defined below.
+        """
         last_date = pd.Timestamp(last_date)
         if last_date.tzinfo is not None:
             last_date = last_date.tz_localize(None)
@@ -1074,11 +1412,9 @@ class TimesFMApp:
 
         prices = np.asarray(self.historical_data[target], dtype=float).reshape(-1)
         if len(dates) != len(prices):
-            # Raising here escaped into Tk's callback machinery and only ever
-            # reached stderr, leaving the user with a silently stale plot.
-            self.log_message(
-                f"Cannot plot: {len(dates)} dates against {len(prices)} prices.", "error"
-            )
+            # Raising escaped into Tk's callback machinery, reached only stderr,
+            # and left the user with a silently stale plot.
+            self.log_message(f"Cannot plot: {len(dates)} dates against {len(prices)} prices.", "error")
             self.canvas.draw()
             return
 
@@ -1089,24 +1425,14 @@ class TimesFMApp:
         if self.forecast_data is not None:
             forecast_values = np.asarray(self.forecast_data, dtype=float).reshape(-1)
             if forecast_values.size:
-                live_anchor = last_date
-                live_price = last_price
-                if self.forecast_anchor is not None:
-                    live_anchor = pd.Timestamp(self.forecast_anchor)
-                    if live_anchor.tzinfo is not None:
-                        live_anchor = live_anchor.tz_localize(None)
-                    live_price = float(pd.Series(prices, index=dates).get(live_anchor, last_price))
-
                 forecast_dates = self._get_forecast_dates(
-                    live_anchor, self.interval_var.get(), forecast_values.size
+                    last_date, self.interval_var.get(), forecast_values.size
                 )
-                # Draw the predicted distribution before the point forecast, so
-                # the line sits on top of its own uncertainty band.
+                # Draw the distribution first so the line sits on its own band.
                 self._draw_quantile_band(forecast_dates)
-
                 self.ax.plot(
-                    pd.DatetimeIndex([live_anchor]).append(forecast_dates),
-                    np.concatenate(([live_price], forecast_values)),
+                    pd.DatetimeIndex([last_date]).append(forecast_dates),
+                    np.concatenate(([last_price], forecast_values)),
                     label="TimesFM Forecast",
                     color="orange",
                     linewidth=2,
@@ -1114,38 +1440,20 @@ class TimesFMApp:
                 )
 
         overlay_colors = ["green", "red", "purple", "brown", "pink", "gray"]
-        history = pd.Series(prices, index=dates)
-        history = history[~history.index.duplicated(keep="last")]
-
         for index, record in enumerate(self.overlay_forecasts):
             overlay_values = np.asarray(record["forecast_data"], dtype=float).reshape(-1)
             if not overlay_values.size:
                 continue
 
-            # Draw each saved forecast from the point it was actually made.
-            # Rows saved before anchor_date existed fall back to the end of the
-            # current series, which is what every overlay used to do.
-            anchor = record.get("anchor_date")
-            if anchor:
-                overlay_anchor = pd.Timestamp(anchor)
-                if overlay_anchor.tzinfo is not None:
-                    overlay_anchor = overlay_anchor.tz_localize(None)
-                anchor_price = float(history.get(overlay_anchor, last_price))
-                label = f"Saved #{record['id']} @ {overlay_anchor.date()}"
-            else:
-                overlay_anchor = last_date
-                anchor_price = last_price
-                label = f"Saved #{record['id']} (unanchored)"
-
             overlay_dates = self._get_forecast_dates(
-                overlay_anchor,
-                record.get("interval") or self.interval_var.get(),
+                last_date,
+                record.get("interval", self.interval_var.get()),
                 overlay_values.size,
             )
             self.ax.plot(
-                pd.DatetimeIndex([overlay_anchor]).append(overlay_dates),
-                np.concatenate(([anchor_price], overlay_values)),
-                label=label,
+                pd.DatetimeIndex([last_date]).append(overlay_dates),
+                np.concatenate(([last_price], overlay_values)),
+                label=f"Saved Forecast #{record['id']}",
                 color=overlay_colors[index % len(overlay_colors)],
                 linewidth=1.5,
                 linestyle=":",
@@ -1158,27 +1466,36 @@ class TimesFMApp:
         self.fig.autofmt_xdate()
         self.canvas.draw()
 
+    def _actuals_series(self, target_column):
+        """Loaded history as a tz-naive Series, or None if unusable."""
+        if self.historical_data is None or self.historical_data.empty:
+            return None
+        if target_column not in self.historical_data.columns:
+            return None
+        dates = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
+        if dates.tz is not None:
+            dates = dates.tz_localize(None)
+        values = pd.to_numeric(self.historical_data[target_column], errors="coerce").to_numpy(float)
+        series = pd.Series(values, index=dates)
+        return series[~series.index.duplicated(keep="last")]
+
     def _draw_quantile_band(self, forecast_dates):
         """Shade the predicted quantile spread as a fan.
 
-        A single line implies a certainty the model never claimed; the band is
-        what the forecast actually says.
+        A single line implies a certainty the model never claimed.
         """
         spread = self.forecast_quantiles
         if not spread:
             return
-
         levels = [float(level) for level in spread["levels"]]
         matrix = np.asarray(spread["values"], dtype=float)
         if matrix.ndim != 2 or matrix.shape[0] != len(forecast_dates):
             return
-
         for low, high, alpha in ((0.1, 0.9, 0.12), (0.2, 0.8, 0.15), (0.3, 0.7, 0.18)):
             if low in levels and high in levels:
                 self.ax.fill_between(
                     forecast_dates,
-                    matrix[:, levels.index(low)],
-                    matrix[:, levels.index(high)],
+                    matrix[:, levels.index(low)], matrix[:, levels.index(high)],
                     color="orange", alpha=alpha, linewidth=0,
                     label=f"{int((high - low) * 100)}% interval",
                 )
@@ -1187,7 +1504,8 @@ class TimesFMApp:
         if self.historical_data is None or self.forecast_data is None:
             messagebox.showinfo("Export", "No complete forecast data to export. Run a forecast first.")
             return
-            
+
+        import csv
         from tkinter import filedialog
 
         filepath = filedialog.asksaveasfilename(
@@ -1195,37 +1513,18 @@ class TimesFMApp:
             filetypes=[("CSV Files", "*.csv")],
             title="Save Forecast Data"
         )
-        
         if not filepath:
             return
-            
+
         try:
-            target = self.forecast_target_col or self.target_col_var.get()
-            forecast_values = np.asarray(self.forecast_data, dtype=float).reshape(-1)
-
-            dates = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
-            if dates.tz is not None:
-                dates = dates.tz_localize(None)
-            anchor = pd.Timestamp(self.forecast_anchor) if self.forecast_anchor is not None else dates[-1]
-            if anchor.tzinfo is not None:
-                anchor = anchor.tz_localize(None)
-            forecast_dates = self._get_forecast_dates(
-                anchor, self.interval_var.get(), forecast_values.size
-            )
-
             with open(filepath, 'w', newline='', encoding='utf-8') as file:
                 writer = csv.writer(file)
-                writer.writerow(["Type", "Date", "Step", target])
-                # Dated history alongside the forecast, so the file can be
-                # reconciled against actuals later without guessing the anchor.
-                for date, value in zip(dates, np.asarray(self.historical_data[target], dtype=float).reshape(-1)):
-                    writer.writerow(["Historical", date.isoformat(), "", value])
-                for step, (date, value) in enumerate(zip(forecast_dates, forecast_values), start=1):
-                    writer.writerow(["Forecast", date.isoformat(), step, value])
-
+                writer.writerow(["Type", "Step", "Forecast_Value"])
+                for index, value in enumerate(self.forecast_data):
+                    writer.writerow(["Forecast", index + 1, value])
             self.log_message(f"Forecast successfully exported to {filepath}")
-        except Exception as e:
-            self.log_message(f"Export Error: {str(e)}", "error")
+        except Exception as error:
+            self.log_message(f"Export Error: {str(error)}")
 
     def refresh_forecast_history(self):
         """Reload the history grid. Safe to call from the UI thread."""
@@ -1235,57 +1534,40 @@ class TimesFMApp:
         # Tkinter is not thread-safe: query here, touch widgets only via after().
         try:
             history = db_manager.get_forecast_history()
-        except Exception as e:
+        except Exception as error:
             self.root.after(0, self.log_message,
-                            f"Error populating forecast history: {str(e)}", "error")
+                            f"Error populating forecast history: {str(error)}", "error")
             return
         self.root.after(0, self._populate_history_grid, history)
 
     def _populate_history_grid(self, history):
         self.run_tree.delete(*self.run_tree.get_children())
-
         for record in history:
-            mae = record['mae_score']
-            mase = record.get('mase_score')
-            direction = record.get('directional_accuracy')
             self.run_tree.insert("", "end", values=(
-                record['id'],
-                record['timestamp'],
-                record['ticker'],
-                record['interval'],
-                record['context_length'],
-                record['horizon_length'],
-                record['model_repo'],
-                record['period'],
-                record['target_column'] or "-",
-                record['anchor_date'] or "-",
-                "-" if mae is None else f"{mae:.4f}",
-                "-" if mase is None else f"{mase:.3f}",
-                "-" if direction is None else f"{direction * 100:.0f}%"
+                record['id'], record['timestamp'], record['ticker'],
+                record.get('target_column') or "-", record['interval'],
+                record['context_length'], record['horizon_length'],
+                record['model_repo'], record['period'],
+                record.get('anchor_date') or "-",
+                self._fmt(record.get('mae_score'), ".4f"),
+                self._fmt(record.get('mase_score')),
+                self._fmt(record.get('directional_accuracy'), ".0f", 100.0, "%"),
             ))
         self.log_message(f"Forecast history grid updated: {len(history)} record(s) loaded.")
 
-    
-    def overlay_selected_forecast(self): 
+    def overlay_selected_forecast(self):
         selected_rows = self.run_tree.selection()
         if not selected_rows:
             messagebox.showinfo("Overlay Forecast", "Select at least one saved forecast first.")
             return
 
         try:
-            current_ticker = self.tkr_var.get().strip().upper()
             records = []
             for row in selected_rows:
                 forecast_id = self.run_tree.item(row, "values")[0]
                 record = db_manager.get_forecast_by_id(forecast_id)
-                if record is None:
-                    continue
-                if (record["ticker"] or "").strip().upper() != current_ticker:
-                    self.log_message(
-                        f"Forecast #{record['id']} is for {record['ticker']}, "
-                        f"not {current_ticker}; plotting it anyway.", "warning"
-                    )
-                records.append(record)
+                if record is not None:
+                    records.append(record)
 
             existing_ids = {record["id"] for record in self.overlay_forecasts}
             new_records = [record for record in records if record["id"] not in existing_ids]
@@ -1295,159 +1577,182 @@ class TimesFMApp:
                 f"Overlayed {len(new_records)} new saved forecast(s); "
                 f"{len(self.overlay_forecasts)} forecast(s) visible on the plot."
             )
-        except Exception as e:
-            self.log_message(f"Error retrieving forecast from database: {str(e)}", "error")
-            messagebox.showerror("Overlay Forecast", str(e))
+        except Exception as error:
+            self.log_message(f"Error retrieving forecast from database: {str(error)}", "error")
+            messagebox.showerror("Overlay Forecast", str(error))
 
     def calculate_mae_for_selected(self):
-        """Score saved forecasts against the actuals currently loaded.
-
-        Only points whose forecast date has since materialised in the history
-        are compared; a forecast still entirely in the future is skipped.
-        """
+        """Persist MAE only for forecast timestamps with finite observations."""
         selected_rows = self.run_tree.selection()
         if not selected_rows:
             messagebox.showinfo("Calculate MAE", "Select at least one saved forecast first.")
             return
-
         if self.historical_data is None or self.historical_data.empty:
-            messagebox.showwarning(
-                "Calculate MAE",
-                "Fetch historical data first - actuals are needed to score a forecast."
-            )
+            messagebox.showwarning("Calculate MAE", "Fetch historical data before calculating MAE.")
             return
 
-        current_ticker = self.tkr_var.get().strip().upper()
-        scored = 0
+        actual_dates = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
+        if actual_dates.tz is not None:
+            actual_dates = actual_dates.tz_localize(None)
+        calculated = []
+        unavailable = []
+        unavailable_reasons = {}
 
-        for row in selected_rows:
-            forecast_id = self.run_tree.item(row, "values")[0]
-            try:
+        try:
+            for row in selected_rows:
+                forecast_id = self.run_tree.item(row, "values")[0]
                 record = db_manager.get_forecast_by_id(forecast_id)
-            except Exception as e:
-                self.log_message(f"Could not load forecast #{forecast_id}: {str(e)}", "error")
-                continue
+                if record is None:
+                    unavailable.append(str(forecast_id))
+                    unavailable_reasons[str(forecast_id)] = "the saved forecast could not be loaded"
+                    continue
+                if not record.get("anchor_date"):
+                    unavailable.append(str(forecast_id))
+                    unavailable_reasons[str(forecast_id)] = "it has no saved forecast origin"
+                    continue
+                if record.get("ticker") and record["ticker"].upper() != self.tkr_var.get().strip().upper():
+                    unavailable.append(str(forecast_id))
+                    unavailable_reasons[str(forecast_id)] = f"it belongs to ticker {record['ticker']}"
+                    continue
 
-            if record is None:
-                self.log_message(f"Forecast #{forecast_id} no longer exists.", "warning")
-                continue
+                target = record.get("target_column") or self.target_col_var.get()
+                if target not in self.historical_data.columns:
+                    unavailable.append(str(forecast_id))
+                    unavailable_reasons[str(forecast_id)] = f"target column '{target}' is not loaded"
+                    continue
+                actual_values = pd.to_numeric(self.historical_data[target], errors="coerce").to_numpy(dtype=float)
+                actual_series = pd.Series(actual_values, index=actual_dates)
 
-            if (record["ticker"] or "").strip().upper() != current_ticker:
-                self.log_message(
-                    f"Skipped #{record['id']}: saved for {record['ticker']}, "
-                    f"loaded data is {current_ticker}.", "warning"
+                forecast_values = np.asarray(record["forecast_data"], dtype=float).reshape(-1)
+                origin = pd.Timestamp(record["anchor_date"])
+                if origin.tzinfo is not None:
+                    origin = origin.tz_localize(None)
+                forecast_dates = self._get_forecast_dates(
+                    origin, record["interval"], forecast_values.size
                 )
-                continue
+                observed_values = actual_series.reindex(forecast_dates).to_numpy()
+                valid = np.isfinite(forecast_values) & np.isfinite(observed_values)
+                if not valid.any():
+                    unavailable.append(str(forecast_id))
+                    unavailable_reasons[str(forecast_id)] = (
+                        f"no observations exist after {origin.date()} for its {record['interval']} interval"
+                    )
+                    continue
 
-            if not record["anchor_date"]:
-                self.log_message(
-                    f"Skipped #{record['id']}: saved before anchor dates were "
-                    "recorded, so it cannot be aligned to actuals.", "warning"
+                y_true = observed_values[valid]
+                y_pred = forecast_values[valid]
+                mae = metrics.mae(y_true, y_pred)
+
+                # MASE scale comes from the context preceding the anchor, so it
+                # never sees data the forecast could not have seen.
+                context = actual_series[actual_series.index <= origin].to_numpy(float)
+                mase = metrics.mase(y_true, y_pred, context, seasonality=1)
+                anchor_value = float(actual_series.get(origin, np.nan))
+                direction = metrics.directional_accuracy(y_true, y_pred, anchor_value)
+
+                db_manager.update_scores(
+                    record["id"], mae_score=mae,
+                    mase_score=None if np.isnan(mase) else mase,
+                    directional_accuracy=None if np.isnan(direction) else direction,
                 )
-                continue
+                calculated.append((record["id"], mae, mase, int(valid.sum()), forecast_values.size))
 
-            target_column = record["target_column"] or self.target_col_var.get()
-            actuals = self._actuals_series(target_column)
-            if actuals is None:
-                self.log_message(
-                    f"Skipped #{record['id']}: column '{target_column}' is not in "
-                    "the loaded data.", "warning"
-                )
-                continue
-
-            forecast_values = np.asarray(record["forecast_data"], dtype=float).reshape(-1)
-            if not forecast_values.size:
-                self.log_message(f"Skipped #{record['id']}: empty forecast.", "warning")
-                continue
-
-            anchor = pd.Timestamp(record["anchor_date"])
-            if anchor.tzinfo is not None:
-                anchor = anchor.tz_localize(None)
-
-            forecast_dates = self._get_forecast_dates(
-                anchor, record["interval"] or self.interval_var.get(), forecast_values.size
-            )
-            aligned = actuals.reindex(forecast_dates)
-            mask = aligned.notna().values
-
-            if not mask.any():
-                self.log_message(
-                    f"Skipped #{record['id']}: no actuals yet for its forecast window.",
-                    "warning"
-                )
-                continue
-
-            y_true = aligned.values[mask]
-            y_pred = forecast_values[mask]
-
-            mae = metrics.mae(y_true, y_pred)
-
-            # MASE denominator comes from the context that preceded the anchor,
-            # so the scale never sees data the forecast could not have seen.
-            context = actuals[actuals.index <= anchor].to_numpy(float)
-            mase = metrics.mase(y_true, y_pred, context, seasonality=1)
-
-            anchor_value = float(actuals.get(anchor, np.nan))
-            direction = metrics.directional_accuracy(y_true, y_pred, anchor_value)
-
-            # What the naive forecast would have scored on the same points.
-            naive_mae = metrics.mae(y_true, np.full(y_true.size, anchor_value))
-
-            try:
-                db_manager.update_scores(record["id"], mae_score=mae,
-                                         mase_score=None if np.isnan(mase) else mase,
-                                         directional_accuracy=None if np.isnan(direction) else direction)
-            except Exception as e:
-                self.log_message(f"Could not save scores for #{record['id']}: {str(e)}", "error")
-                continue
-
-            scored += 1
-            verdict = "beats naive" if np.isfinite(mae) and np.isfinite(naive_mae) and mae < naive_mae else "does NOT beat naive"
-            self.log_message(
-                f"Forecast #{record['id']} ({target_column}): MAE {mae:.4f} vs naive "
-                f"{naive_mae:.4f}, MASE {mase:.3f}, direction {direction * 100:.0f}% "
-                f"over {int(mask.sum())}/{forecast_values.size} point(s) - {verdict}.",
-                "info" if mae < naive_mae else "warning"
-            )
-
-        if scored:
             self.refresh_forecast_history()
-        else:
-            self.log_message("No selected forecast could be scored.", "warning")
-
+            if calculated:
+                summary = ", ".join(
+                    f"#{forecast_id}: MAE {mae:.4f} / MASE {mase:.3f} ({matched}/{total} points)"
+                    for forecast_id, mae, mase, matched, total in calculated
+                )
+                self.log_message(f"Scored: {summary}")
+                if any(m >= 1.0 for _, _, m, _, _ in calculated if m == m):
+                    self.log_message(
+                        "MASE >= 1 means the forecast did not beat a naive one.", "warning")
+            if unavailable:
+                reason_text = "\n".join(
+                    f"#{forecast_id}: {unavailable_reasons.get(forecast_id, 'no matching observations')}"
+                    for forecast_id in unavailable
+                )
+                self.log_message(f"MAE unavailable:\n{reason_text}", "warning")
+                messagebox.showinfo(
+                    "Calculate MAE",
+                    "MAE could not be calculated for these forecast(s):\n" + reason_text,
+                )
+        except Exception as error:
+            self.log_message(f"Error calculating MAE: {str(error)}", "error")
+            messagebox.showerror("Calculate MAE", str(error))
+         
     def delete_selected_forecast(self):
         selected_rows = self.run_tree.selection()
         if not selected_rows:
-            messagebox.showinfo("Delete Forecast", "Select at least one saved forecast first.")
+            messagebox.showinfo("Delete Forecast", "Select at least one saved forecast to delete.")
             return
 
-        if not messagebox.askyesno(
-            "Delete Forecast",
-            f"Permanently delete {len(selected_rows)} saved forecast(s)?\n"
-            "This cannot be undone."
-        ):
-            return
-
-        deleted_ids = []
-        for row in selected_rows:
-            forecast_id = self.run_tree.item(row, "values")[0]
+        if messagebox.askyesno("Confirm Deletion", f"Are you sure you want to permanently delete {len(selected_rows)} forecast(s)?"):
             try:
-                if db_manager.delete_forecast(forecast_id):
-                    deleted_ids.append(int(forecast_id))
-                else:
-                    self.log_message(f"Forecast #{forecast_id} was already gone.", "warning")
+                for row in selected_rows:
+                    forecast_id = self.run_tree.item(row, "values")[0]
+                    db_manager.delete_forecast(forecast_id)
+                self.refresh_forecast_history()
+                self.log_message(f"Successfully deleted {len(selected_rows)} forecast(s) from the database.")
             except Exception as e:
-                self.log_message(f"Delete failed for #{forecast_id}: {str(e)}", "error")
+                self.log_message(f"Error deleting forecast: {str(e)}", "error")
+                messagebox.showerror("Delete Error", f"Could not delete: {str(e)}")
 
-        if deleted_ids:
-            # Drop anything we just deleted from the plot as well.
-            remaining = [r for r in self.overlay_forecasts if r["id"] not in deleted_ids]
-            if len(remaining) != len(self.overlay_forecasts):
-                self.overlay_forecasts = remaining
-                self.update_plot()
+    def scan_local_models(self):
+        self.model_listbox.delete(0, tk.END)
+        models_dir = "./models"
+        os.makedirs(models_dir, exist_ok=True)
+        
+        found_models = False
+        for item in os.listdir(models_dir):
+            if os.path.isdir(os.path.join(models_dir, item)):
+                self.model_listbox.insert(tk.END, item)
+                found_models = True
+                
+        if not found_models:
+            self.model_listbox.insert(tk.END, "(No local models found in ./models)")
 
-        self.log_message(f"Deleted {len(deleted_ids)} saved forecast(s).")
-        self.refresh_forecast_history()
+    def set_active_local_model(self):
+        selection = self.model_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Set Active Model", "Select a downloaded model from the list first.")
+            return
+            
+        model_folder = self.model_listbox.get(selection[0])
+        if model_folder.startswith("("): return # Ignore the "None found" placeholder
+        
+        full_path = os.path.abspath(os.path.join("./models", model_folder))
+        self.repo_var.set(full_path)
+        self.log_message(f"Active model set to local path: {full_path}")
+        messagebox.showinfo("Model Updated", f"App will now load weights from:\n{full_path}")
+
+    def thread_download_model(self):
+        if not HF_HUB_AVAILABLE:
+            messagebox.showerror("Missing Library", "The 'huggingface_hub' library is not installed.\nPlease run: pip install huggingface_hub")
+            return
+            
+        repo_id = self.dl_repo_var.get().strip()
+        if not repo_id: return
+        
+        self.download_btn.state(['disabled'])
+        self.log_message(f"Starting download of HuggingFace repo '{repo_id}' to local storage...")
+        threading.Thread(target=self._download_model_job, args=(repo_id,), daemon=True).start()
+
+    def _download_model_job(self, repo_id):
+        try:
+            # Replace slashes with ___ to make it a safe folder name
+            folder_name = repo_id.replace("/", "___")
+            save_path = os.path.join("./models", folder_name)
+            
+            # This handles downloading only the necessary model weights
+            snapshot_download(repo_id=repo_id, local_dir=save_path)
+            
+            self.root.after(0, self.log_message, f"Successfully downloaded and verified {repo_id}")
+            self.root.after(0, self.scan_local_models)
+        except Exception as e:
+            self.root.after(0, self.log_message, f"Model download failed: {str(e)}", "error")
+        finally:
+            self.root.after(0, lambda: self.download_btn.state(['!disabled']))
 
 if __name__ == "__main__":
     root = tk.Tk()

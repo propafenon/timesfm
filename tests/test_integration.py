@@ -30,7 +30,7 @@ import db_manager as db
 db.DB_DIR = tempfile.mkdtemp()
 db.DB_PATH = os.path.join(db.DB_DIR, 'integration.db')
 
-import timesfm_forecaster_old as forecaster
+import timesfm_forecaster as forecaster
 from scipy import stats as st
 
 app = forecaster.TimesFMApp(_root)

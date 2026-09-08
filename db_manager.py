@@ -142,9 +142,20 @@ def _migrate_to_v1(conn):
     conn.execute('ALTER TABLE forecast_runs RENAME TO forecast_runs_legacy')
     conn.execute(_CREATE_TABLE)
 
-    rows = conn.execute('''
+    legacy = {row[1] for row in conn.execute('PRAGMA table_info(forecast_runs_legacy)')}
+
+    # A database written by a different branch may name the anchor
+    # 'forecast_origin'. It is the same field, so carry it across rather than
+    # leaving every historical row with a NULL anchor and therefore unscorable.
+    if 'forecast_origin' in legacy:
+        anchor_expression = 'COALESCE(anchor_date, forecast_origin)'
+    else:
+        anchor_expression = 'anchor_date'
+
+    rows = conn.execute(f'''
         SELECT id, timestamp, ticker, interval, context_length, horizon_length,
-               model_repo, period, forecast_data, mae_score, target_column, anchor_date
+               model_repo, period, forecast_data, mae_score, target_column,
+               {anchor_expression}
         FROM forecast_runs_legacy
     ''').fetchall()
 
