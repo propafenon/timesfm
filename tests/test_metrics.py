@@ -30,7 +30,11 @@ print("coverage OK")
 
 # Direction: anchor 100, truths up/up/down, preds up/down/down -> 2 of 3
 close(m.directional_accuracy([101,102,99],[105,95,98],100), 2/3)
-print("directional OK")
+# A flat forecast has no directional view: nan, not 0%
+assert np.isnan(m.directional_accuracy([101,102,99],[100,100,100],100))
+# Steps where the model is flat are excluded, not counted as misses
+close(m.directional_accuracy([101,102,99],[105,100,98],100), 1.0)
+print("directional OK (flat forecasts excluded, not scored as wrong)")
 
 # Diebold-Mariano: B is plainly better, statistic must be positive and significant
 rng=np.random.default_rng(0)

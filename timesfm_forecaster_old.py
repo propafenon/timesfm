@@ -6,6 +6,9 @@ import traceback
 import numpy as np
 import pandas as pd
 import db_manager
+import data_cache
+import backtest
+import metrics
 import csv
 import sys
 
@@ -56,6 +59,10 @@ class TimesFMApp:
         # rather than at save time so it stays correct if the data is refetched.
         self.forecast_anchor = None
         self.forecast_target_col = None
+        self.forecast_quantiles = None
+        self.data_meta = {}
+        self.backtest_thread = None
+        self.backtest_stop = threading.Event()
         self.overlay_forecasts = []
         self.is_processing = False
         
@@ -80,6 +87,7 @@ class TimesFMApp:
             self.log_message(f"Database initialization failed: {str(e)}", "error")
 
         self.refresh_forecast_history()
+        self.refresh_backtest_history()
 
     def setup_ui(self):
 
@@ -90,11 +98,11 @@ class TimesFMApp:
         #Creating the tabs inside the parent notebook
         tab_inference = ttk.Frame(parent_notebook)
         tab_logs = ttk.Frame(parent_notebook)
-        tab_settings = ttk.Frame(parent_notebook)
+        tab_backtest = ttk.Frame(parent_notebook)
 
         parent_notebook.add(tab_inference, text="Inference & Visualization")
         parent_notebook.add(tab_logs, text="System Logs")
-        parent_notebook.add(tab_settings, text="Model Settings")
+        parent_notebook.add(tab_backtest, text="Backtest & Validation")
 
         # INFERENCE & VISUALIZATION TAB
         left_panel = ttk.Frame(tab_inference, width=350, padding=(10, 10, 10, 10))
@@ -122,7 +130,7 @@ class TimesFMApp:
         self.data_grid_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         ## DATA GRID and children
-        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "Target", "Anchor Date", "MAE Score"), show="headings", selectmode="extended")
+        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "Target", "Anchor Date", "MAE", "MASE", "Dir %"), show="headings", selectmode="extended")
         self.run_tree.pack(fill="both", expand=True, side="left")
         self.run_tree.heading("ID", text="ID",)
         self.run_tree.heading("Timestamp", text="Timestamp")
@@ -134,7 +142,10 @@ class TimesFMApp:
         self.run_tree.heading("Period", text="Period")
         self.run_tree.heading("Target", text="Target")
         self.run_tree.heading("Anchor Date", text="Anchor Date")
-        self.run_tree.heading("MAE Score", text="MAE Score")
+        self.run_tree.heading("MAE", text="MAE")
+        # MASE is the column to read: < 1 beats a naive forecast, >= 1 does not.
+        self.run_tree.heading("MASE", text="MASE (<1 = skill)")
+        self.run_tree.heading("Dir %", text="Dir %")
 
         tree_scrollbar_horizontal = ttk.Scrollbar(self.data_grid_frame, orient="horizontal", command=self.run_tree.xview)
         tree_scrollbar_vertical = ttk.Scrollbar(self.data_grid_frame, orient="vertical", command=self.run_tree.yview)
@@ -170,7 +181,336 @@ class TimesFMApp:
         self.log_text.tag_config("error", foreground="#ff5555")
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
+        self.build_backtest_tab(tab_backtest)
         self.init_plot()
+
+    # ----------------------------------------------------------------
+    # Backtest tab
+    # ----------------------------------------------------------------
+
+    def build_backtest_tab(self, parent):
+        controls = ttk.LabelFrame(parent, text="Walk-Forward Configuration", padding=(10, 5))
+        controls.pack(fill="x", padx=10, pady=(10, 5))
+
+        def spin(label, var, column, width=7):
+            ttk.Label(controls, text=label).grid(row=0, column=column * 2, sticky="w", padx=(8, 2))
+            ttk.Entry(controls, textvariable=var, width=width).grid(row=0, column=column * 2 + 1, sticky="w")
+
+        self.bt_context_var = tk.IntVar(value=256)
+        self.bt_horizon_var = tk.IntVar(value=5)
+        self.bt_step_var = tk.IntVar(value=5)
+        self.bt_cost_var = tk.DoubleVar(value=10.0)
+
+        spin("Context:", self.bt_context_var, 0)
+        spin("Horizon:", self.bt_horizon_var, 1)
+        spin("Step:", self.bt_step_var, 2)
+        spin("Cost (bps):", self.bt_cost_var, 3)
+
+        ttk.Label(controls, text="Window:").grid(row=0, column=8, sticky="w", padx=(8, 2))
+        self.bt_mode_var = tk.StringVar(value="sliding")
+        ttk.Combobox(controls, textvariable=self.bt_mode_var, values=["sliding", "expanding"],
+                     width=10, state="readonly").grid(row=0, column=9, sticky="w")
+
+        self.bt_baselines_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Include baselines", variable=self.bt_baselines_var
+                        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        self.bt_timesfm_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls, text="Include TimesFM (slow: one inference per origin)",
+                        variable=self.bt_timesfm_var
+                        ).grid(row=1, column=3, columnspan=5, sticky="w", pady=(6, 0))
+
+        buttons = ttk.Frame(parent)
+        buttons.pack(fill="x", padx=10)
+        self.bt_run_btn = ttk.Button(buttons, text="Run Backtest", command=self.thread_run_backtest)
+        self.bt_run_btn.pack(side="left", padx=(0, 5), pady=5)
+        self.bt_stop_btn = ttk.Button(buttons, text="Stop", command=self.stop_backtest, state="disabled")
+        self.bt_stop_btn.pack(side="left", padx=5, pady=5)
+        ttk.Button(buttons, text="Refresh Saved", command=self.refresh_backtest_history).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Delete Selected", command=self.delete_selected_backtest).pack(side="left", padx=5)
+        ttk.Button(buttons, text="Per-Step Detail", command=self.show_step_detail).pack(side="left", padx=5)
+
+        self.bt_progress = ttk.Label(parent, text="Idle.")
+        self.bt_progress.pack(fill="x", padx=10)
+
+        columns = ("ID", "Model", "Origins", "MASE h1", "MASE all", "Skill%", "Dir%",
+                   "DM p", "CRPS", "Cov80", "IC", "Sharpe", "MaxDD", "DSR")
+        results = ttk.LabelFrame(parent, text="Results  (MASE < 1 beats naive; DSR is the "
+                                              "probability the Sharpe survives how many configs you tried)",
+                                 padding=(10, 5))
+        results.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.bt_tree = ttk.Treeview(results, columns=columns, show="headings", selectmode="browse")
+        for column in columns:
+            self.bt_tree.heading(column, text=column)
+            self.bt_tree.column(column, width=72, anchor="center")
+        self.bt_tree.column("Model", width=130, anchor="w")
+        self.bt_tree.pack(fill="both", expand=True, side="left")
+
+        scroll = ttk.Scrollbar(results, orient="vertical", command=self.bt_tree.yview)
+        scroll.pack(side="right", fill="y")
+        self.bt_tree.configure(yscrollcommand=scroll.set)
+
+    def stop_backtest(self):
+        self.backtest_stop.set()
+        self.log_message("Stop requested; finishing the current origin.", "warning")
+
+    def thread_run_backtest(self):
+        if self.backtest_thread is not None and self.backtest_thread.is_alive():
+            messagebox.showinfo("Backtest", "A backtest is already running.")
+            return
+        if self.historical_data is None or self.historical_data.empty:
+            messagebox.showwarning("Backtest", "Fetch data first.")
+            return
+        if self.bt_timesfm_var.get() and self.loaded_model is None:
+            messagebox.showwarning(
+                "Backtest",
+                "Run a forecast once first so the model is loaded, or untick TimesFM."
+            )
+            return
+        if self.adjusted_var.get():
+            proceed = messagebox.askyesno(
+                "Backtest on adjusted prices?",
+                "The loaded data is split/dividend adjusted, which folds information "
+                "from after each bar into that bar. That is look-ahead bias.\n\n"
+                "Untick 'Adjusted prices', refetch, and backtest on raw prices for a "
+                "clean result.\n\nRun anyway?"
+            )
+            if not proceed:
+                return
+
+        self.backtest_stop.clear()
+        self.bt_run_btn.state(['disabled'])
+        self.bt_stop_btn.state(['!disabled'])
+        self.backtest_thread = threading.Thread(target=self._run_backtest_job, daemon=True)
+        self.backtest_thread.start()
+
+    def _timesfm_model_fn(self, horizon):
+        """Wrap the already-loaded model in the backtest's model_fn contract."""
+        def _forecast(context, steps):
+            window = np.asarray(context, dtype=np.float32).reshape(-1)
+            if EVALUATOR_MODE == "timesfm3":
+                outputs = list(self.loaded_model.predict_batch(
+                    [window], horizon=steps, return_quantiles=True,
+                    use_symmetric_averaging=False))
+                point = np.asarray(outputs[0].forecast, dtype=float).reshape(-1)
+                raw = getattr(outputs[0], "quantiles", None)
+            else:
+                point_forecast, quantile_forecast = self.loaded_model.forecast(
+                    [window], freq=[self.freq_ind_var.get()])
+                point = np.asarray(point_forecast[0], dtype=float).reshape(-1)
+                raw = np.asarray(quantile_forecast)[0] if quantile_forecast is not None else None
+
+            spread = self._normalise_quantiles(raw, steps)
+            return point[:steps], (np.asarray(spread["values"]) if spread else None)
+        return _forecast
+
+    def _run_backtest_job(self):
+        try:
+            target = self.target_col_var.get()
+            series = self._actuals_series(target)
+            if series is None:
+                raise ValueError(f"Column '{target}' is not in the loaded data.")
+
+            values = series.to_numpy(float)
+            dates = series.index
+            context_len = int(self.bt_context_var.get())
+            horizon = int(self.bt_horizon_var.get())
+            step = max(int(self.bt_step_var.get()), 1)
+            mode = self.bt_mode_var.get()
+            cost_bps = float(self.bt_cost_var.get())
+            interval = self.interval_var.get()
+            ticker = self.tkr_var.get().strip().upper()
+
+            origins = backtest.plan_origins(values.size, context_len, horizon, step)
+            if not origins:
+                raise ValueError(
+                    f"{values.size} bars cannot support a {context_len}-bar context "
+                    f"plus a {horizon}-step horizon. Fetch a longer period or shrink the context."
+                )
+
+            models = {}
+            if self.bt_baselines_var.get():
+                models.update(backtest.BASELINES)
+                extra = backtest.try_statsforecast_baselines()
+                if extra:
+                    models.update(extra)
+                    self.root.after(0, self.log_message,
+                                    f"statsforecast found: added {', '.join(extra)}.")
+            if self.bt_timesfm_var.get():
+                models["timesfm"] = self._timesfm_model_fn(horizon)
+            if not models:
+                raise ValueError("Select at least one model to backtest.")
+
+            self.root.after(0, self.log_message,
+                            f"Walk-forward: {len(origins)} origins x {len(models)} model(s), "
+                            f"horizon {horizon}, step {step}, {mode} window.")
+
+            n_trials = max(db_manager.count_forecast_runs(), 1)
+            table, saved = {}, []
+
+            for index, (name, model_fn) in enumerate(models.items(), start=1):
+                if self.backtest_stop.is_set():
+                    break
+
+                def progress(done, total, label=name, position=index, count=len(models)):
+                    self.root.after(0, self._set_backtest_progress,
+                                    f"[{position}/{count}] {label}: origin {done}/{total}")
+
+                rows = backtest.walk_forward(
+                    values, dates, model_fn, context_len, horizon, step,
+                    mode=mode, progress_cb=progress,
+                    should_stop=self.backtest_stop.is_set,
+                )
+                if not rows:
+                    continue
+
+                summary = backtest.summarize(rows, interval=interval,
+                                             cost_bps=cost_bps, n_trials=n_trials)
+                table[name] = summary
+
+                run_id = db_manager.insert_backtest_run(
+                    ticker=ticker, interval=interval, period=self.period_var.get(),
+                    model_name=name, context_length=context_len, horizon_length=horizon,
+                    step=step, mode=mode, adjusted=self.adjusted_var.get(),
+                    cost_bps=cost_bps, n_origins=summary.get("n_origins"),
+                    n_points=summary.get("n_points"), summary=summary,
+                )
+                db_manager.insert_backtest_points(run_id, rows)
+                saved.append((run_id, name))
+
+            self.root.after(0, self._on_backtest_done, table, saved)
+
+        except Exception as e:
+            self.root.after(0, self._on_backtest_error,
+                            f"{str(e)}\n{traceback.format_exc()}")
+
+    def _set_backtest_progress(self, text):
+        self.bt_progress.config(text=text)
+
+    def _on_backtest_error(self, message):
+        self.log_message(str(message), "error")
+        messagebox.showerror("Backtest", str(message).strip().splitlines()[0])
+        self._finish_backtest()
+
+    def _finish_backtest(self):
+        self.bt_run_btn.state(['!disabled'])
+        self.bt_stop_btn.state(['disabled'])
+
+    def _on_backtest_done(self, table, saved):
+        self._finish_backtest()
+        self.bt_progress.config(text=f"Done. {len(saved)} run(s) saved.")
+        self.refresh_backtest_history()
+
+        if not table:
+            self.log_message("Backtest produced no results.", "warning")
+            return
+
+        ranked = sorted(table.items(),
+                        key=lambda kv: (kv[1].get("mase_step1") or float('inf')))
+        best, best_summary = ranked[0]
+        self.log_message(
+            f"Best one-step MASE: {best} at {best_summary.get('mase_step1', float('nan')):.3f}."
+        )
+        if (best_summary.get("mase_step1") or 9e9) >= 1.0:
+            self.log_message(
+                "No model beat the naive forecast at h=1. That is the expected "
+                "result on price levels, and it is the honest answer.", "warning"
+            )
+
+    def refresh_backtest_history(self):
+        threading.Thread(target=self._load_backtest_history_job, daemon=True).start()
+
+    def _load_backtest_history_job(self):
+        try:
+            runs = db_manager.get_backtest_runs()
+        except Exception as e:
+            self.root.after(0, self.log_message, f"Could not load backtests: {str(e)}", "error")
+            return
+        self.root.after(0, self._populate_backtest_grid, runs)
+
+    @staticmethod
+    def _fmt(value, spec=".3f", scale=1.0, suffix=""):
+        if value is None:
+            return "-"
+        try:
+            number = float(value) * scale
+        except (TypeError, ValueError):
+            return "-"
+        return "-" if number != number else format(number, spec) + suffix
+
+    def _populate_backtest_grid(self, runs):
+        self.bt_tree.delete(*self.bt_tree.get_children())
+        for run in runs:
+            summary = run.get("summary") or {}
+            self.bt_tree.insert("", "end", values=(
+                run["id"],
+                f"{run['model_name']} ({run['ticker']})",
+                run.get("n_origins") or "-",
+                self._fmt(summary.get("mase_step1")),
+                self._fmt(summary.get("mase")),
+                self._fmt(summary.get("skill_vs_naive"), ".1f", 100.0, "%"),
+                self._fmt(summary.get("directional_accuracy"), ".0f", 100.0, "%"),
+                self._fmt(summary.get("dm_pvalue_vs_naive")),
+                self._fmt(summary.get("crps"), ".4f"),
+                self._fmt(summary.get("coverage_80"), ".0f", 100.0, "%"),
+                self._fmt(summary.get("ic")),
+                self._fmt(summary.get("sharpe_net"), ".2f"),
+                self._fmt(summary.get("max_drawdown"), ".1f", 100.0, "%"),
+                self._fmt(summary.get("deflated_sharpe"), ".2f"),
+            ))
+        self.log_message(f"Backtest grid updated: {len(runs)} run(s).")
+
+    def _selected_backtest_id(self):
+        selection = self.bt_tree.selection()
+        if not selection:
+            messagebox.showinfo("Backtest", "Select a backtest run first.")
+            return None
+        return int(self.bt_tree.item(selection[0], "values")[0])
+
+    def delete_selected_backtest(self):
+        run_id = self._selected_backtest_id()
+        if run_id is None:
+            return
+        if not messagebox.askyesno("Delete Backtest",
+                                   f"Delete run #{run_id} and all of its points?"):
+            return
+        try:
+            db_manager.delete_backtest_run(run_id)
+            self.log_message(f"Deleted backtest run #{run_id}.")
+        except Exception as e:
+            self.log_message(f"Delete failed: {str(e)}", "error")
+        self.refresh_backtest_history()
+
+    def show_step_detail(self):
+        """Error by horizon step. Pooled numbers hide that error grows with h."""
+        run_id = self._selected_backtest_id()
+        if run_id is None:
+            return
+        try:
+            run = next((r for r in db_manager.get_backtest_runs() if r["id"] == run_id), None)
+        except Exception as e:
+            self.log_message(f"Could not load run #{run_id}: {str(e)}", "error")
+            return
+        if run is None:
+            return
+
+        by_step = (run.get("summary") or {}).get("by_step") or []
+        if not by_step:
+            messagebox.showinfo("Per-Step Detail", "This run has no per-step breakdown.")
+            return
+
+        self.log_message(f"--- Run #{run_id} ({run['model_name']}) by horizon step ---")
+        for entry in by_step:
+            # Any of these can be null: nan is stored as JSON null, and a flat
+            # forecast has no directional accuracy at all.
+            self.log_message(
+                f"    h={entry.get('step')}  n={entry.get('n')}  "
+                f"MAE={self._fmt(entry.get('mae'), '.4f')}  "
+                f"MASE={self._fmt(entry.get('mase'), '.3f')}  "
+                f"skill={self._fmt(entry.get('skill_vs_naive'), '+.1f', 100.0, '%')}  "
+                f"dir={self._fmt(entry.get('directional_accuracy'), '.0f', 100.0, '%')}"
+            )
 
     def build_data_settings(self):
         data_frame = ttk.LabelFrame(self.settings_frame, text="1. Data Farming (yfinance)", padding=(10, 5))
@@ -190,7 +530,17 @@ class TimesFMApp:
         
         ttk.Label(data_frame, text="Target Column:").grid(row=3, column=0, sticky="w", pady=2)
         self.target_col_var = tk.StringVar(value="Close")
-        ttk.Combobox(data_frame, textvariable=self.target_col_var, values=["Open", "High", "Low", "Close", "Volume"], width=13, state="readonly").grid(row=3, column=1, sticky="w", pady=2)
+        ttk.Combobox(data_frame, textvariable=self.target_col_var, values=["Open", "High", "Low", "Close", "Adj Close", "Volume"], width=13, state="readonly").grid(row=3, column=1, sticky="w", pady=2)
+
+        # Adjusted closes embed dividends and splits announced AFTER the bar.
+        # Fine looking forward, look-ahead in a backtest, so make it a choice.
+        self.adjusted_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(data_frame, text="Adjusted prices (uncheck to backtest)",
+                        variable=self.adjusted_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
+
+        self.force_refresh_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(data_frame, text="Bypass local cache",
+                        variable=self.force_refresh_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
 
     def build_model_settings(self):
         model_frame = ttk.LabelFrame(self.settings_frame, text="2. TimesFM 3.0 Configuration", padding=(10, 5))
@@ -295,29 +645,38 @@ class TimesFMApp:
 
     def _fetch_data_job(self):
         try:
-            if yf is None:
-                raise ImportError("yfinance library is missing.")
-                
             ticker = self.tkr_var.get().strip().upper()
             period = self.period_var.get()
             interval = self.interval_var.get()
-            
-            # Added timeout=10 to prevent network hanging that locks the UI thread permanently
-            data = yf.download(ticker, period=period, interval=interval, progress=False, timeout=10)
-            
+
+            # Served from the local cache when it is fresh. Beyond saving a
+            # round trip, this is what makes a backtest reproducible: yfinance
+            # revises history, so re-downloading moves the target.
+            data, meta = data_cache.get_ohlcv(
+                ticker, period, interval,
+                adjusted=self.adjusted_var.get(),
+                force_refresh=self.force_refresh_var.get(),
+            )
+
             if data.empty:
                 raise ValueError(f"No data returned for ticker {ticker}.")
-                
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.get_level_values(0)
-                
+
             self.historical_data = data
+            self.data_meta = meta
             self.root.after(0, self._on_fetch_success)
         except Exception as e:
             self.root.after(0, self._on_process_error, str(e))
 
     def _on_fetch_success(self):
-        self.log_message(f"Successfully fetched {len(self.historical_data)} data points.")
+        meta = getattr(self, "data_meta", {}) or {}
+        origin = meta.get("source", "download")
+        detail = f" (from {origin}"
+        if origin == "cache":
+            detail += f", {meta.get('age_hours', 0)}h old"
+        detail += f", {'adjusted' if meta.get('adjusted') else 'raw'} prices)"
+        self.log_message(f"Successfully fetched {len(self.historical_data)} data points{detail}.")
+        if not meta.get("adjusted", True):
+            self.log_message("Raw prices in use: correct for backtesting, but splits will show as jumps.", "warning")
         self.overlay_forecasts.clear()
         # The live forecast belongs to the series it was run against. Keeping it
         # after a refetch left a stale curve on the chart with no way to tell.
@@ -325,6 +684,7 @@ class TimesFMApp:
             self.forecast_data = None
             self.forecast_anchor = None
             self.forecast_target_col = None
+            self.forecast_quantiles = None
             self.log_message("Cleared the previous forecast; re-run it against the new data.", "warning")
         self.update_plot()
         self.set_processing_state(False)
@@ -434,20 +794,34 @@ class TimesFMApp:
             # Run the actual prediction
             input_context = input_context.astype(np.float32)
             
+            raw_quantiles = None
             if EVALUATOR_MODE == "timesfm3":
                 # TimesFM 3.0 uses predict_batch instead of forecast
                 outputs = list(self.loaded_model.predict_batch(
                     [input_context],
                     horizon=horizon,
-                    return_quantiles=False,
+                    # Was False, which threw away the single most useful thing
+                    # the model produces: its uncertainty.
+                    return_quantiles=True,
                     use_symmetric_averaging=False
                 ))
                 forecast_result = outputs[0].forecast
+                raw_quantiles = getattr(outputs[0], "quantiles", None)
             else:
                 freq_ind = [self.freq_ind_var.get()]
-                point_forecast, _ = self.loaded_model.forecast([input_context], freq=freq_ind)
+                point_forecast, quantile_forecast = self.loaded_model.forecast(
+                    [input_context], freq=freq_ind
+                )
                 forecast_result = point_forecast[0]
+                # Legacy timesfm returns [batch, horizon, 10]: column 0 is the
+                # mean, columns 1..9 are deciles. This used to be discarded.
+                if quantile_forecast is not None:
+                    raw_quantiles = np.asarray(quantile_forecast)[0]
 
+            self.forecast_quantiles = self._normalise_quantiles(raw_quantiles, horizon)
+            if self.forecast_quantiles:
+                self.root.after(0, self.log_message,
+                                f"Captured {len(self.forecast_quantiles['levels'])} quantile levels.")
             self.forecast_data = forecast_result
             self.forecast_anchor = self.historical_data.index[-1]
             self.forecast_target_col = target_col
@@ -481,11 +855,52 @@ class TimesFMApp:
                 mae_score=None,  # Filled in later by calculate_mae_for_selected
                 target_column=self.forecast_target_col or self.target_col_var.get(),
                 anchor_date=self._anchor_to_iso(self.forecast_anchor),
+                quantiles=self.forecast_quantiles,
             )
             self.log_message("Forecast results saved to database successfully.")
             self.refresh_forecast_history()
         except Exception as db_e:
             self.log_message(f"Database save failed: {str(db_e)}", "error")
+
+    @staticmethod
+    def _normalise_quantiles(raw, horizon):
+        """Coerce whatever the backend returned into {levels, values}.
+
+        The two evaluator paths disagree on shape and neither documents it
+        firmly, so this is deliberately defensive: anything unrecognised
+        degrades to no quantiles rather than a crash mid-forecast.
+        """
+        if raw is None:
+            return None
+        try:
+            matrix = np.asarray(raw, dtype=float)
+        except (TypeError, ValueError):
+            return None
+
+        if matrix.ndim == 3 and matrix.shape[0] == 1:
+            matrix = matrix[0]
+        if matrix.ndim != 2:
+            return None
+        if matrix.shape[0] != horizon and matrix.shape[1] == horizon:
+            matrix = matrix.T
+        if matrix.shape[0] != horizon:
+            return None
+
+        width = matrix.shape[1]
+        if width == 10:
+            # column 0 is the mean, not a quantile
+            matrix = matrix[:, 1:]
+            levels = [round(0.1 * i, 1) for i in range(1, 10)]
+        elif width == 9:
+            levels = [round(0.1 * i, 1) for i in range(1, 10)]
+        else:
+            levels = [round((i + 1) / (width + 1), 4) for i in range(width)]
+
+        if not np.isfinite(matrix).all():
+            return None
+        # Quantiles must not cross; models occasionally emit them unsorted.
+        matrix = np.sort(matrix, axis=1)
+        return {"levels": levels, "values": matrix.tolist()}
 
     @staticmethod
     def _anchor_to_iso(anchor):
@@ -593,6 +1008,10 @@ class TimesFMApp:
                 forecast_dates = self._get_forecast_dates(
                     live_anchor, self.interval_var.get(), forecast_values.size
                 )
+                # Draw the predicted distribution before the point forecast, so
+                # the line sits on top of its own uncertainty band.
+                self._draw_quantile_band(forecast_dates)
+
                 self.ax.plot(
                     pd.DatetimeIndex([live_anchor]).append(forecast_dates),
                     np.concatenate(([live_price], forecast_values)),
@@ -646,6 +1065,31 @@ class TimesFMApp:
         self.ax.legend()
         self.fig.autofmt_xdate()
         self.canvas.draw()
+
+    def _draw_quantile_band(self, forecast_dates):
+        """Shade the predicted quantile spread as a fan.
+
+        A single line implies a certainty the model never claimed; the band is
+        what the forecast actually says.
+        """
+        spread = self.forecast_quantiles
+        if not spread:
+            return
+
+        levels = [float(level) for level in spread["levels"]]
+        matrix = np.asarray(spread["values"], dtype=float)
+        if matrix.ndim != 2 or matrix.shape[0] != len(forecast_dates):
+            return
+
+        for low, high, alpha in ((0.1, 0.9, 0.12), (0.2, 0.8, 0.15), (0.3, 0.7, 0.18)):
+            if low in levels and high in levels:
+                self.ax.fill_between(
+                    forecast_dates,
+                    matrix[:, levels.index(low)],
+                    matrix[:, levels.index(high)],
+                    color="orange", alpha=alpha, linewidth=0,
+                    label=f"{int((high - low) * 100)}% interval",
+                )
 
     def export_csv(self):
         if self.historical_data is None or self.forecast_data is None:
@@ -710,6 +1154,8 @@ class TimesFMApp:
 
         for record in history:
             mae = record['mae_score']
+            mase = record.get('mase_score')
+            direction = record.get('directional_accuracy')
             self.run_tree.insert("", "end", values=(
                 record['id'],
                 record['timestamp'],
@@ -721,7 +1167,9 @@ class TimesFMApp:
                 record['period'],
                 record['target_column'] or "-",
                 record['anchor_date'] or "-",
-                "-" if mae is None else f"{mae:.4f}"
+                "-" if mae is None else f"{mae:.4f}",
+                "-" if mase is None else f"{mase:.3f}",
+                "-" if direction is None else f"{direction * 100:.0f}%"
             ))
         self.log_message(f"Forecast history grid updated: {len(history)} record(s) loaded.")
 
@@ -837,18 +1285,37 @@ class TimesFMApp:
                 )
                 continue
 
-            mae = float(np.mean(np.abs(forecast_values[mask] - aligned.values[mask])))
+            y_true = aligned.values[mask]
+            y_pred = forecast_values[mask]
+
+            mae = metrics.mae(y_true, y_pred)
+
+            # MASE denominator comes from the context that preceded the anchor,
+            # so the scale never sees data the forecast could not have seen.
+            context = actuals[actuals.index <= anchor].to_numpy(float)
+            mase = metrics.mase(y_true, y_pred, context, seasonality=1)
+
+            anchor_value = float(actuals.get(anchor, np.nan))
+            direction = metrics.directional_accuracy(y_true, y_pred, anchor_value)
+
+            # What the naive forecast would have scored on the same points.
+            naive_mae = metrics.mae(y_true, np.full(y_true.size, anchor_value))
 
             try:
-                db_manager.update_mae_score(record["id"], mae)
+                db_manager.update_scores(record["id"], mae_score=mae,
+                                         mase_score=None if np.isnan(mase) else mase,
+                                         directional_accuracy=None if np.isnan(direction) else direction)
             except Exception as e:
-                self.log_message(f"Could not save MAE for #{record['id']}: {str(e)}", "error")
+                self.log_message(f"Could not save scores for #{record['id']}: {str(e)}", "error")
                 continue
 
             scored += 1
+            verdict = "beats naive" if np.isfinite(mae) and np.isfinite(naive_mae) and mae < naive_mae else "does NOT beat naive"
             self.log_message(
-                f"Forecast #{record['id']} ({target_column}): MAE {mae:.4f} over "
-                f"{int(mask.sum())}/{forecast_values.size} matched point(s)."
+                f"Forecast #{record['id']} ({target_column}): MAE {mae:.4f} vs naive "
+                f"{naive_mae:.4f}, MASE {mase:.3f}, direction {direction * 100:.0f}% "
+                f"over {int(mask.sum())}/{forecast_values.size} point(s) - {verdict}.",
+                "info" if mae < naive_mae else "warning"
             )
 
         if scored:

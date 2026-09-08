@@ -283,7 +283,9 @@ def _directional(frame):
     anchors = frame["anchor_value"].to_numpy(float)
     true_dir = np.sign(frame["y_true"].to_numpy(float) - anchors)
     pred_dir = np.sign(frame["y_pred"].to_numpy(float) - anchors)
-    scored = true_dir != 0
+    # Both sides must have a direction: a flat forecast has no view, and
+    # scoring it as wrong makes the naive baseline look 0% accurate.
+    scored = (true_dir != 0) & (pred_dir != 0)
     if not scored.any():
         return float("nan")
     return float(np.mean(true_dir[scored] == pred_dir[scored]))

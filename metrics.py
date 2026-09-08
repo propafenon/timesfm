@@ -91,7 +91,10 @@ def directional_accuracy(y_true, y_pred, anchor):
         return float('nan')
     true_dir = np.sign(y_true - anchor)
     pred_dir = np.sign(y_pred - anchor)
-    scored = true_dir != 0
+    # Score only steps where BOTH sides have a direction. A flat forecast
+    # expresses no view, and counting that as wrong reports a naive baseline
+    # as 0% accurate when the honest answer is "no opinion".
+    scored = (true_dir != 0) & (pred_dir != 0)
     if not scored.any():
         return float('nan')
     return float(np.mean(true_dir[scored] == pred_dir[scored]))
