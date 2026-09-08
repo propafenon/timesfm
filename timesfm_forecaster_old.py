@@ -17,6 +17,7 @@ except ImportError:
 try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
+    import matplotlib.dates as mdates
 except ImportError:
     print("matplotlib is not installed. Please install it using: pip install matplotlib")
     FigureCanvasTkAgg = None
@@ -50,6 +51,7 @@ class TimesFMApp:
         # Internal state variables
         self.historical_data = None
         self.forecast_data = None
+        self.overlay_forecasts = []
         self.is_processing = False
         
         # Model Caching State to prevent OOM/Bottlenecks
@@ -120,7 +122,7 @@ class TimesFMApp:
         self.data_grid_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         ## DATA GRID and children
-        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "MAE Score"), show="headings")
+        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "MAE Score"), show="headings", selectmode="extended")
         self.run_tree.pack(fill="both", expand=True, side="left")
         self.run_tree.heading("ID", text="ID",)
         self.run_tree.heading("Timestamp", text="Timestamp")
@@ -311,6 +313,7 @@ class TimesFMApp:
 
     def _on_fetch_success(self):
         self.log_message(f"Successfully fetched {len(self.historical_data)} data points.")
+        self.overlay_forecasts.clear()
         self.update_plot()
         self.set_processing_state(False)
 
@@ -422,7 +425,7 @@ class TimesFMApp:
                 forecast_result = point_forecast[0]
 
             self.forecast_data = forecast_result
-            
+
             self.root.after(0, self._on_forecast_success)
             
         except Exception as e:
@@ -460,48 +463,100 @@ class TimesFMApp:
         messagebox.showerror("Process Error", str(error_msg))
         self.set_processing_state(False)
 
+    def _get_forecast_dates(self, last_date, interval, length):
+        """Return timezone-naive dates immediately after the historical data."""
+        last_date = pd.Timestamp(last_date)
+        if last_date.tzinfo is not None:
+            last_date = last_date.tz_localize(None)
+
+        if interval == "1d":
+            return pd.DatetimeIndex(
+                pd.bdate_range(
+                    start=last_date + pd.Timedelta(days=1),
+                    periods=length,
+                )
+            )
+
+        interval_map = {
+            "1m": pd.Timedelta(minutes=1),
+            "5m": pd.Timedelta(minutes=5),
+            "15m": pd.Timedelta(minutes=15),
+            "30m": pd.Timedelta(minutes=30),
+            "1h": pd.Timedelta(hours=1),
+            "1wk": pd.Timedelta(weeks=1),
+            "1mo": pd.DateOffset(months=1),
+        }
+        step = interval_map.get(interval, pd.Timedelta(days=1))
+        return pd.DatetimeIndex([last_date + (step * offset) for offset in range(1, length + 1)])
+
     def update_plot(self):
-        if not hasattr(self, 'ax'): return
-        
+        if not hasattr(self, "ax"):
+            return
+
         self.ax.clear()
         self.ax.set_title(f"{self.tkr_var.get()} Historical & Forecast ({self.target_col_var.get()})")
-        self.ax.set_xlabel("Time")
+        self.ax.set_xlabel("Date")
         self.ax.set_ylabel("Price")
-        self.ax.grid(True, linestyle='--', alpha=0.6)
-        
-        if self.historical_data is not None:
-            target = self.target_col_var.get()
-            dates = self.historical_data.index
-            prices = self.historical_data[target]
-            
-            self.ax.plot(dates, prices, label="Historical Data", color="blue", linewidth=1.5)
-            
-            if self.forecast_data is not None:
-                last_date = dates[-1]
-                interval = self.interval_var.get()
-                
-                # FIXED LOGIC FLAW: Account for weekends on daily datasets
-                if interval == "1d":
-                    # Generate business days only (skips Saturday/Sunday)
-                    future_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=len(self.forecast_data))
-                else:
-                    interval_map = {
-                        "1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
-                        "15m": pd.Timedelta(minutes=15), "30m": pd.Timedelta(minutes=30),
-                        "1h": pd.Timedelta(hours=1),
-                        "1wk": pd.Timedelta(weeks=1), "1mo": pd.DateOffset(months=1)
-                    }
-                    step = interval_map.get(interval, pd.Timedelta(days=1))
-                    future_dates = [last_date + (step * i) for i in range(1, len(self.forecast_data) + 1)]
-                
-                connected_dates = [last_date] + list(future_dates)
-                connected_prices = [prices.iloc[-1]] + list(self.forecast_data)
-                
-                self.ax.plot(connected_dates, connected_prices, label="TimesFM Forecast", color="orange", linewidth=2, linestyle="--")
-                
-            self.ax.legend()
-            self.fig.autofmt_xdate()
+        self.ax.grid(True, linestyle="--", alpha=0.6)
+
+        if self.historical_data is None or self.historical_data.empty:
             self.canvas.draw()
+            return
+
+        target = self.target_col_var.get()
+        dates = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
+        if dates.tz is not None:
+            dates = dates.tz_localize(None)
+
+        prices = np.asarray(self.historical_data[target], dtype=float).reshape(-1)
+        if len(dates) != len(prices):
+            raise ValueError("Historical dates and prices have different lengths.")
+
+        self.ax.plot(dates, prices, label="Historical Data", color="blue", linewidth=1.5)
+        last_date = dates[-1]
+        last_price = float(prices[-1])
+
+        if self.forecast_data is not None:
+            forecast_values = np.asarray(self.forecast_data, dtype=float).reshape(-1)
+            if forecast_values.size:
+                forecast_dates = self._get_forecast_dates(
+                    last_date, self.interval_var.get(), forecast_values.size
+                )
+                self.ax.plot(
+                    pd.DatetimeIndex([last_date]).append(forecast_dates),
+                    np.concatenate(([last_price], forecast_values)),
+                    label="TimesFM Forecast",
+                    color="orange",
+                    linewidth=2,
+                    linestyle="--",
+                )
+
+        overlay_colors = ["green", "red", "purple", "brown", "pink", "gray"]
+        for index, record in enumerate(self.overlay_forecasts):
+            overlay_values = np.asarray(record["forecast_data"], dtype=float).reshape(-1)
+            if not overlay_values.size:
+                continue
+
+            overlay_dates = self._get_forecast_dates(
+                last_date,
+                record.get("interval", self.interval_var.get()),
+                overlay_values.size,
+            )
+            self.ax.plot(
+                pd.DatetimeIndex([last_date]).append(overlay_dates),
+                np.concatenate(([last_price], overlay_values)),
+                label=f"Saved Forecast #{record['id']}",
+                color=overlay_colors[index % len(overlay_colors)],
+                linewidth=1.5,
+                linestyle=":",
+            )
+
+        self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        self.ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(self.ax.xaxis.get_major_locator()))
+        self.ax.yaxis.get_major_formatter().set_useOffset(False)
+        self.ax.legend()
+        self.fig.autofmt_xdate()
+        self.canvas.draw()
 
     def export_csv(self):
         if self.historical_data is None or self.forecast_data is None:
@@ -553,12 +608,36 @@ class TimesFMApp:
             self.log_message(f"Error populating forecast history: {str(e)}", "error")
 
     
-    # TODO     
     def overlay_selected_forecast(self): 
+        selected_rows = self.run_tree.selection()
+        if not selected_rows:
+            messagebox.showinfo("Overlay Forecast", "Select at least one saved forecast first.")
+            return
+
+        try:
+            records = []
+            for row in selected_rows:
+                forecast_id = self.run_tree.item(row, "values")[0]
+                record = db_manager.get_forecast_by_id(forecast_id)
+                if record is not None:
+                    records.append(record)
+
+            existing_ids = {record["id"] for record in self.overlay_forecasts}
+            new_records = [record for record in records if record["id"] not in existing_ids]
+            self.overlay_forecasts.extend(new_records)
+            self.update_plot()
+            self.log_message(
+                f"Overlayed {len(new_records)} new saved forecast(s); "
+                f"{len(self.overlay_forecasts)} forecast(s) visible on the plot."
+            )
+        except Exception as e:
+            self.log_message(f"Error retrieving forecast from database: {str(e)}", "error")
+            messagebox.showerror("Overlay Forecast", str(e))
+
+    # TODO
+    def calculate_mae_for_selected(self): # TODO 
         return
-    # TODO     
-    def calculate_mae_for_selected(self):
-        return
+    
     # TODO     
     def delete_selected_forecast(self):
         return

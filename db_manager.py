@@ -70,6 +70,33 @@ def get_forecast_history():
     conn.close()
     return history
 
+def get_forecast_by_id(forecast_id):
+    conn = sq3.connect('./runs/forecast_history.db')
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT * FROM forecast_runs WHERE id = ?', (forecast_id,))
+    row = cursor.fetchone()
+
+    if row:
+        id, timestamp, ticker, interval, context_length, horizon_length, model_repo, period, forecast_data_blob, mae_score = row
+        forecast_data = pickle.loads(forecast_data_blob)
+        result = {
+            'id': id,
+            'timestamp': timestamp,
+            'ticker': ticker,
+            'interval': interval,
+            'context_length': context_length,
+            'horizon_length': horizon_length,
+            'model_repo': model_repo,
+            'period': period,
+            'forecast_data': forecast_data,
+            'mae_score': mae_score
+        }
+    else:
+        result = None
+
+    conn.close()
+    return result
 
 
 init_db()
