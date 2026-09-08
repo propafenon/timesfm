@@ -51,6 +51,10 @@ class TimesFMApp:
         # Internal state variables
         self.historical_data = None
         self.forecast_data = None
+        # What the live forecast was conditioned on, captured at inference time
+        # rather than at save time so it stays correct if the data is refetched.
+        self.forecast_anchor = None
+        self.forecast_target_col = None
         self.overlay_forecasts = []
         self.is_processing = False
         
@@ -74,12 +78,7 @@ class TimesFMApp:
         except Exception as e:
             self.log_message(f"Database initialization failed: {str(e)}", "error")
 
-        try:
-            populate_thread = threading.Thread(target=self.refresh_forecast_history, daemon=True)
-            populate_thread.start() 
-            self.log_message(f"History succesfully populated: {len(self.run_tree.get_children())} records loaded.")
-        except Exception as e:
-            self.log_message(f"Failed to populate forecast history on startup: {str(e)}", "error")
+        self.refresh_forecast_history()
 
     def setup_ui(self):
 
@@ -122,7 +121,7 @@ class TimesFMApp:
         self.data_grid_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         ## DATA GRID and children
-        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "MAE Score"), show="headings", selectmode="extended")
+        self.run_tree = ttk.Treeview(self.data_grid_frame, columns=("ID", "Timestamp", "Ticker", "Interval", "Context Length", "Horizon Length", "Model Repo", "Period", "Target", "Anchor Date", "MAE Score"), show="headings", selectmode="extended")
         self.run_tree.pack(fill="both", expand=True, side="left")
         self.run_tree.heading("ID", text="ID",)
         self.run_tree.heading("Timestamp", text="Timestamp")
@@ -132,6 +131,8 @@ class TimesFMApp:
         self.run_tree.heading("Horizon Length", text="Horizon Length")
         self.run_tree.heading("Model Repo", text="Model Repo")
         self.run_tree.heading("Period", text="Period")
+        self.run_tree.heading("Target", text="Target")
+        self.run_tree.heading("Anchor Date", text="Anchor Date")
         self.run_tree.heading("MAE Score", text="MAE Score")
 
         tree_scrollbar_horizontal = ttk.Scrollbar(self.data_grid_frame, orient="horizontal", command=self.run_tree.xview)
@@ -425,6 +426,8 @@ class TimesFMApp:
                 forecast_result = point_forecast[0]
 
             self.forecast_data = forecast_result
+            self.forecast_anchor = self.historical_data.index[-1]
+            self.forecast_target_col = target_col
 
             self.root.after(0, self._on_forecast_success)
             
@@ -445,18 +448,46 @@ class TimesFMApp:
 
         try:
             db_manager.insert_forecast(
-                            ticker=self.tkr_var.get(),
-                            interval=self.interval_var.get(),
-                            context_length=self.context_len_var.get(),
-                            horizon_length=self.horizon_var.get(),
-                            model_repo=self.repo_var.get(),
-                            period=self.period_var.get(),
-                            forecast_data=self.forecast_data.tolist(),
-                            mae_score=None  # Placeholder for MAE score, can be computed later if needed
-                        )
-            self.root.after(0, self.log_message, "Forecast results saved to database successfully.")
+                ticker=self.tkr_var.get().strip().upper(),
+                interval=self.interval_var.get(),
+                context_length=self.context_len_var.get(),
+                horizon_length=self.horizon_var.get(),
+                model_repo=self.repo_var.get(),
+                period=self.period_var.get(),
+                forecast_data=np.asarray(self.forecast_data, dtype=float).reshape(-1).tolist(),
+                mae_score=None,  # Filled in later by calculate_mae_for_selected
+                target_column=self.forecast_target_col or self.target_col_var.get(),
+                anchor_date=self._anchor_to_iso(self.forecast_anchor),
+            )
+            self.log_message("Forecast results saved to database successfully.")
+            self.refresh_forecast_history()
         except Exception as db_e:
-                        self.root.after(0, self.log_message, f"Database save failed: {str(db_e)}", "error")
+            self.log_message(f"Database save failed: {str(db_e)}", "error")
+
+    @staticmethod
+    def _anchor_to_iso(anchor):
+        """Normalise a forecast anchor to a timezone-naive ISO string."""
+        if anchor is None:
+            return None
+        anchor = pd.Timestamp(anchor)
+        if anchor.tzinfo is not None:
+            anchor = anchor.tz_localize(None)
+        return anchor.isoformat()
+
+    def _actuals_series(self, target_column):
+        """Loaded history as a tz-naive Series, or None if unusable."""
+        if self.historical_data is None or self.historical_data.empty:
+            return None
+        if target_column not in self.historical_data.columns:
+            return None
+
+        dates = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
+        if dates.tz is not None:
+            dates = dates.tz_localize(None)
+
+        values = np.asarray(self.historical_data[target_column], dtype=float).reshape(-1)
+        series = pd.Series(values, index=dates)
+        return series[~series.index.duplicated(keep="last")]
 
     def _on_process_error(self, error_msg):
         self.log_message(f"ERROR: {error_msg}")
@@ -532,20 +563,38 @@ class TimesFMApp:
                 )
 
         overlay_colors = ["green", "red", "purple", "brown", "pink", "gray"]
+        history = pd.Series(prices, index=dates)
+        history = history[~history.index.duplicated(keep="last")]
+
         for index, record in enumerate(self.overlay_forecasts):
             overlay_values = np.asarray(record["forecast_data"], dtype=float).reshape(-1)
             if not overlay_values.size:
                 continue
 
+            # Draw each saved forecast from the point it was actually made.
+            # Rows saved before anchor_date existed fall back to the end of the
+            # current series, which is what every overlay used to do.
+            anchor = record.get("anchor_date")
+            if anchor:
+                overlay_anchor = pd.Timestamp(anchor)
+                if overlay_anchor.tzinfo is not None:
+                    overlay_anchor = overlay_anchor.tz_localize(None)
+                anchor_price = float(history.get(overlay_anchor, last_price))
+                label = f"Saved #{record['id']} @ {overlay_anchor.date()}"
+            else:
+                overlay_anchor = last_date
+                anchor_price = last_price
+                label = f"Saved #{record['id']} (unanchored)"
+
             overlay_dates = self._get_forecast_dates(
-                last_date,
-                record.get("interval", self.interval_var.get()),
+                overlay_anchor,
+                record.get("interval") or self.interval_var.get(),
                 overlay_values.size,
             )
             self.ax.plot(
-                pd.DatetimeIndex([last_date]).append(overlay_dates),
-                np.concatenate(([last_price], overlay_values)),
-                label=f"Saved Forecast #{record['id']}",
+                pd.DatetimeIndex([overlay_anchor]).append(overlay_dates),
+                np.concatenate(([anchor_price], overlay_values)),
+                label=label,
                 color=overlay_colors[index % len(overlay_colors)],
                 linewidth=1.5,
                 linestyle=":",
@@ -587,25 +636,38 @@ class TimesFMApp:
             self.log_message(f"Export Error: {str(e)}")
 
     def refresh_forecast_history(self):
+        """Reload the history grid. Safe to call from the UI thread."""
+        threading.Thread(target=self._load_forecast_history_job, daemon=True).start()
+
+    def _load_forecast_history_job(self):
+        # Tkinter is not thread-safe: query here, touch widgets only via after().
         try:
             history = db_manager.get_forecast_history()
-            self.run_tree.delete(*self.run_tree.get_children())
-            
-            for record in history:
-                self.run_tree.insert("", "end", values=(
-                    record['id'],
-                    record['timestamp'],
-                    record['ticker'],
-                    record['interval'],
-                    record['context_length'],
-                    record['horizon_length'],
-                    record['model_repo'],
-                    record['period'],
-                    record['mae_score']
-                ))
-            self.log_message("Forecast history grid updated successfully.")
         except Exception as e:
-            self.log_message(f"Error populating forecast history: {str(e)}", "error")
+            self.root.after(0, self.log_message,
+                            f"Error populating forecast history: {str(e)}", "error")
+            return
+        self.root.after(0, self._populate_history_grid, history)
+
+    def _populate_history_grid(self, history):
+        self.run_tree.delete(*self.run_tree.get_children())
+
+        for record in history:
+            mae = record['mae_score']
+            self.run_tree.insert("", "end", values=(
+                record['id'],
+                record['timestamp'],
+                record['ticker'],
+                record['interval'],
+                record['context_length'],
+                record['horizon_length'],
+                record['model_repo'],
+                record['period'],
+                record['target_column'] or "-",
+                record['anchor_date'] or "-",
+                "-" if mae is None else f"{mae:.4f}"
+            ))
+        self.log_message(f"Forecast history grid updated: {len(history)} record(s) loaded.")
 
     
     def overlay_selected_forecast(self): 
@@ -615,12 +677,19 @@ class TimesFMApp:
             return
 
         try:
+            current_ticker = self.tkr_var.get().strip().upper()
             records = []
             for row in selected_rows:
                 forecast_id = self.run_tree.item(row, "values")[0]
                 record = db_manager.get_forecast_by_id(forecast_id)
-                if record is not None:
-                    records.append(record)
+                if record is None:
+                    continue
+                if (record["ticker"] or "").strip().upper() != current_ticker:
+                    self.log_message(
+                        f"Forecast #{record['id']} is for {record['ticker']}, "
+                        f"not {current_ticker}; plotting it anyway.", "warning"
+                    )
+                records.append(record)
 
             existing_ids = {record["id"] for record in self.overlay_forecasts}
             new_records = [record for record in records if record["id"] not in existing_ids]
@@ -634,13 +703,136 @@ class TimesFMApp:
             self.log_message(f"Error retrieving forecast from database: {str(e)}", "error")
             messagebox.showerror("Overlay Forecast", str(e))
 
-    # TODO
-    def calculate_mae_for_selected(self): # TODO 
-        return
-    
-    # TODO     
+    def calculate_mae_for_selected(self):
+        """Score saved forecasts against the actuals currently loaded.
+
+        Only points whose forecast date has since materialised in the history
+        are compared; a forecast still entirely in the future is skipped.
+        """
+        selected_rows = self.run_tree.selection()
+        if not selected_rows:
+            messagebox.showinfo("Calculate MAE", "Select at least one saved forecast first.")
+            return
+
+        if self.historical_data is None or self.historical_data.empty:
+            messagebox.showwarning(
+                "Calculate MAE",
+                "Fetch historical data first - actuals are needed to score a forecast."
+            )
+            return
+
+        current_ticker = self.tkr_var.get().strip().upper()
+        scored = 0
+
+        for row in selected_rows:
+            forecast_id = self.run_tree.item(row, "values")[0]
+            try:
+                record = db_manager.get_forecast_by_id(forecast_id)
+            except Exception as e:
+                self.log_message(f"Could not load forecast #{forecast_id}: {str(e)}", "error")
+                continue
+
+            if record is None:
+                self.log_message(f"Forecast #{forecast_id} no longer exists.", "warning")
+                continue
+
+            if (record["ticker"] or "").strip().upper() != current_ticker:
+                self.log_message(
+                    f"Skipped #{record['id']}: saved for {record['ticker']}, "
+                    f"loaded data is {current_ticker}.", "warning"
+                )
+                continue
+
+            if not record["anchor_date"]:
+                self.log_message(
+                    f"Skipped #{record['id']}: saved before anchor dates were "
+                    "recorded, so it cannot be aligned to actuals.", "warning"
+                )
+                continue
+
+            target_column = record["target_column"] or self.target_col_var.get()
+            actuals = self._actuals_series(target_column)
+            if actuals is None:
+                self.log_message(
+                    f"Skipped #{record['id']}: column '{target_column}' is not in "
+                    "the loaded data.", "warning"
+                )
+                continue
+
+            forecast_values = np.asarray(record["forecast_data"], dtype=float).reshape(-1)
+            if not forecast_values.size:
+                self.log_message(f"Skipped #{record['id']}: empty forecast.", "warning")
+                continue
+
+            anchor = pd.Timestamp(record["anchor_date"])
+            if anchor.tzinfo is not None:
+                anchor = anchor.tz_localize(None)
+
+            forecast_dates = self._get_forecast_dates(
+                anchor, record["interval"] or self.interval_var.get(), forecast_values.size
+            )
+            aligned = actuals.reindex(forecast_dates)
+            mask = aligned.notna().values
+
+            if not mask.any():
+                self.log_message(
+                    f"Skipped #{record['id']}: no actuals yet for its forecast window.",
+                    "warning"
+                )
+                continue
+
+            mae = float(np.mean(np.abs(forecast_values[mask] - aligned.values[mask])))
+
+            try:
+                db_manager.update_mae_score(record["id"], mae)
+            except Exception as e:
+                self.log_message(f"Could not save MAE for #{record['id']}: {str(e)}", "error")
+                continue
+
+            scored += 1
+            self.log_message(
+                f"Forecast #{record['id']} ({target_column}): MAE {mae:.4f} over "
+                f"{int(mask.sum())}/{forecast_values.size} matched point(s)."
+            )
+
+        if scored:
+            self.refresh_forecast_history()
+        else:
+            self.log_message("No selected forecast could be scored.", "warning")
+
     def delete_selected_forecast(self):
-        return
+        selected_rows = self.run_tree.selection()
+        if not selected_rows:
+            messagebox.showinfo("Delete Forecast", "Select at least one saved forecast first.")
+            return
+
+        if not messagebox.askyesno(
+            "Delete Forecast",
+            f"Permanently delete {len(selected_rows)} saved forecast(s)?\n"
+            "This cannot be undone."
+        ):
+            return
+
+        deleted_ids = []
+        for row in selected_rows:
+            forecast_id = self.run_tree.item(row, "values")[0]
+            try:
+                if db_manager.delete_forecast(forecast_id):
+                    deleted_ids.append(int(forecast_id))
+                else:
+                    self.log_message(f"Forecast #{forecast_id} was already gone.", "warning")
+            except Exception as e:
+                self.log_message(f"Delete failed for #{forecast_id}: {str(e)}", "error")
+
+        if deleted_ids:
+            # Drop anything we just deleted from the plot as well.
+            remaining = [r for r in self.overlay_forecasts if r["id"] not in deleted_ids]
+            if len(remaining) != len(self.overlay_forecasts):
+                self.overlay_forecasts = remaining
+                self.update_plot()
+
+        self.log_message(f"Deleted {len(deleted_ids)} saved forecast(s).")
+        self.refresh_forecast_history()
 
 if __name__ == "__main__":
     root = tk.Tk()
