@@ -10,6 +10,7 @@ import data_cache
 import backtest
 import metrics
 import transforms
+import features
 import csv
 import os  # Added for scanning local model directories
 import sys
@@ -55,6 +56,19 @@ except ImportError:
         TIMESFM_AVAILABLE = False
 
 
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+# Weights already sitting in ./models are preferred over the hub id at startup,
+# so a first launch with no network still comes up with a usable model.
+DEFAULT_REPO = "google/timesfm-3.0-pytorch"
+DEFAULT_LOCAL_DIRNAME = "google___timesfm-3.0-pytorch"
+
+
+def resolve_default_repo():
+    local = os.path.join(MODELS_DIR, DEFAULT_LOCAL_DIRNAME)
+    return local if os.path.isdir(local) else DEFAULT_REPO
+
+
 class TimesFMApp:
     def __init__(self, root):
         """Construct the UI, initialize storage, and load saved history asynchronously."""
@@ -84,6 +98,7 @@ class TimesFMApp:
         self.data_meta = {}
         self.backtest_thread = None
         self.backtest_stop = threading.Event()
+        self.model_lock = threading.Lock()
         # These collections describe the fetched feature table and its UI selections.
         self.feature_catalog = []
         self.external_source_vars = {}
@@ -110,6 +125,10 @@ class TimesFMApp:
         # reported 0 records.
         self.refresh_forecast_history()
         self.refresh_backtest_history()
+
+        # Load TimesFM 3.0 in the background so the first forecast does not pay
+        # the download and initialisation cost. The UI stays usable throughout.
+        threading.Thread(target=self._autoload_model_job, daemon=True).start()
 
     def setup_ui(self):
 
@@ -273,6 +292,9 @@ class TimesFMApp:
         self.plot_frame = ttk.LabelFrame(right_panel, text="Data & Forecast Visualization")
         self.plot_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
         
+        self.model_status_label = ttk.Label(right_panel, text="Model: starting...", foreground="#333333")
+        self.model_status_label.grid(row=2, column=0, sticky="w", pady=(4, 0))
+
         self.log_frame = ttk.LabelFrame(right_panel, text="System Logs & Status")
         self.log_frame.grid(row=1, column=0, sticky="nsew")
         
@@ -402,16 +424,36 @@ class TimesFMApp:
     def _timesfm_model_fn(self, horizon):
         """Wrap the already-loaded model in the backtest's model_fn contract.
 
-        Covariates are passed as None: a walk-forward would have to re-slice
-        every covariate column at every origin to stay leak-free, which the
-        univariate path does not need.
+        Declares wants_covariates, so the engine hands over a covariate window
+        re-sliced at each origin. Standardisation happens here against that
+        window only, matching what inference does and keeping it leak-free.
         """
-        def _forecast(context, steps):
+        def _forecast(context, steps, covariate_window=None):
+            covariate_array = None
+            if covariate_window is not None and covariate_window.size:
+                covariate_array = features.standardize_context(covariate_window)
             point, spread = self._predict_loaded_model(
-                np.asarray(context, dtype=np.float32), None, steps, want_quantiles=True
+                np.asarray(context, dtype=np.float32), covariate_array, steps,
+                want_quantiles=True
             )
             return point, (np.asarray(spread["values"]) if spread else None)
+        _forecast.wants_covariates = True
         return _forecast
+
+    def _backtest_covariate_matrix(self, selected):
+        """(n_features, n_observations) aligned to the target, forward-filled only."""
+        if not selected:
+            return None, []
+        rows, used = [], []
+        for column in selected:
+            if column not in self.historical_data.columns:
+                continue
+            values = pd.to_numeric(self.historical_data[column], errors="coerce")
+            if not np.isfinite(values.to_numpy(float)).any():
+                continue
+            rows.append(values.ffill().to_numpy(float))
+            used.append(column)
+        return (np.asarray(rows, dtype=float) if rows else None), used
 
     def _run_backtest_job(self):
         try:
@@ -447,8 +489,16 @@ class TimesFMApp:
                     models.update(extra)
                     self.root.after(0, self.log_message,
                                     f"statsforecast found: added {', '.join(extra)}.")
+            covariate_matrix, covariates_used = (None, [])
             if self.bt_timesfm_var.get():
                 models["timesfm"] = self._timesfm_model_fn(horizon)
+                covariate_matrix, covariates_used = self._backtest_covariate_matrix(
+                    self._selected_covariates()
+                )
+                if covariates_used:
+                    self.root.after(0, self.log_message,
+                                    f"Backtesting with {len(covariates_used)} covariate(s), "
+                                    "re-sliced at every origin.")
             if not models:
                 raise ValueError("Select at least one model to backtest.")
 
@@ -483,6 +533,7 @@ class TimesFMApp:
                     values, dates, model_fn, context_len, horizon, step,
                     mode=mode, progress_cb=progress,
                     should_stop=self.backtest_stop.is_set,
+                    covariates=covariate_matrix,
                 )
                 if not rows:
                     continue
@@ -669,15 +720,46 @@ class TimesFMApp:
         features_frame = ttk.LabelFrame(self.settings_frame, text="2. Features and External Series", padding=(10, 5))
         features_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
         ttk.Label(features_frame, text="Additional sources (aligned to the market dates):").pack(anchor="w")
+        # The full catalogue: policy rates, inflation, FX, energy, metals,
+        # credit spreads and risk proxies. Roughly 15 are ticked by default,
+        # which is the working range for TimesFM historical covariates.
         self.external_sources = {
-            "Crude oil (WTI)": ("yahoo", "CL=F"), "Brent crude oil": ("yahoo", "BZ=F"),
-            "USD/TRY exchange rate": ("yahoo", "USDTRY=X"), "EUR/USD exchange rate": ("yahoo", "EURUSD=X"),
-            "US federal funds rate": ("fred", "DFF"), "US 10-year treasury rate": ("fred", "DGS10"),
+            label: (source, symbol)
+            for label, (source, symbol, _note) in features.MACRO_CATALOG.items()
         }
-        for label in self.external_sources:
-            variable = tk.BooleanVar(value=False)
+        self.external_notes = {
+            label: note for label, (_s, _sym, note) in features.MACRO_CATALOG.items()
+        }
+
+        preset_row = ttk.Frame(features_frame)
+        preset_row.pack(fill=tk.X, pady=(4, 2))
+        ttk.Button(preset_row, text="Default 15", width=10,
+                   command=lambda: self._apply_macro_preset("default")).pack(side=tk.LEFT)
+        ttk.Button(preset_row, text="All", width=5,
+                   command=lambda: self._apply_macro_preset("all")).pack(side=tk.LEFT, padx=3)
+        ttk.Button(preset_row, text="None", width=6,
+                   command=lambda: self._apply_macro_preset("none")).pack(side=tk.LEFT)
+        self.macro_count_label = ttk.Label(preset_row, text="")
+        self.macro_count_label.pack(side=tk.LEFT, padx=(8, 0))
+
+        # 27 checkboxes do not fit a fixed panel, so give them their own scroller.
+        macro_canvas = tk.Canvas(features_frame, height=190, highlightthickness=0)
+        macro_scroll = ttk.Scrollbar(features_frame, orient="vertical", command=macro_canvas.yview)
+        macro_inner = ttk.Frame(macro_canvas)
+        macro_inner.bind("<Configure>",
+                         lambda e: macro_canvas.configure(scrollregion=macro_canvas.bbox("all")))
+        macro_canvas.create_window((0, 0), window=macro_inner, anchor="nw")
+        macro_canvas.configure(yscrollcommand=macro_scroll.set)
+        macro_canvas.pack(side="top", fill="x", expand=False)
+        macro_scroll.pack(side="top", fill="x")
+
+        for label, (source, symbol) in self.external_sources.items():
+            variable = tk.BooleanVar(value=label in features.DEFAULT_MACRO_SELECTION)
+            variable.trace_add("write", lambda *_: self._update_macro_count())
             self.external_source_vars[label] = variable
-            ttk.Checkbutton(features_frame, text=label, variable=variable).pack(anchor="w")
+            ttk.Checkbutton(macro_inner, text=f"{label}  [{source}:{symbol}]",
+                            variable=variable).pack(anchor="w")
+
         ttk.Label(features_frame, text="Custom sources (yahoo:SYMBOL or fred:SERIES_ID, comma-separated):").pack(anchor="w", pady=(4, 0))
         self.custom_source_var = tk.StringVar()
         ttk.Entry(features_frame, textvariable=self.custom_source_var, width=34).pack(fill=tk.X)
@@ -698,7 +780,7 @@ class TimesFMApp:
         model_frame = ttk.LabelFrame(self.settings_frame, text="2. TimesFM 3.0 Configuration", padding=(10, 5))
         model_frame.pack(fill=tk.X, pady=(0, 10), padx=5)
         ttk.Label(model_frame, text="HuggingFace Repo ID:").grid(row=0, column=0, columnspan=2, sticky="w", pady=(2, 0))
-        self.repo_var = tk.StringVar(value="google/timesfm-3.0-pytorch")
+        self.repo_var = tk.StringVar(value=resolve_default_repo())
         ttk.Entry(model_frame, textvariable=self.repo_var, width=32).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 5))
         ttk.Label(model_frame, text="Context Length (Input):").grid(row=2, column=0, sticky="w", pady=2)
         self.context_len_var = tk.IntVar(value=1056)
@@ -845,56 +927,23 @@ class TimesFMApp:
         self.set_processing_state(False)
 
     def _add_engineered_features(self, data):
-        """Create common technical indicators while retaining the raw OHLCV columns.
+        """Technical and statistical columns, all computed causally.
 
-        Indicators are calculated locally from the downloaded market data so the
-        model receives a reproducible feature table rather than provider-specific
-        indicator fields.
+        Delegates to features.build_features so the backtest engine and the GUI
+        derive covariates the same way.
         """
-        data = data.copy()
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        data = data.loc[:, ~data.columns.duplicated()]
-        close = pd.to_numeric(data.get("Close"), errors="coerce")
-        high = pd.to_numeric(data.get("High", close), errors="coerce")
-        low = pd.to_numeric(data.get("Low", close), errors="coerce")
-        volume = pd.to_numeric(data.get("Volume"), errors="coerce")
-        if close is None or close.dropna().empty:
-            raise ValueError("The downloaded data does not contain a usable Close series.")
-
-        delta = close.diff()
-        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-        rs = gain / loss.replace(0, np.nan)
-        data["RSI_14"] = 100 - (100 / (1 + rs))
-        data["EMA_12"] = close.ewm(span=12, adjust=False).mean()
-        data["EMA_26"] = close.ewm(span=26, adjust=False).mean()
-        data["MACD"] = data["EMA_12"] - data["EMA_26"]
-        data["MACD_Signal"] = data["MACD"].ewm(span=9, adjust=False).mean()
-        data["SMA_20"] = close.rolling(20, min_periods=20).mean()
-        data["Bollinger_Middle"] = data["SMA_20"]
-        rolling_std = close.rolling(20, min_periods=20).std()
-        data["Bollinger_Upper"] = data["SMA_20"] + 2 * rolling_std
-        data["Bollinger_Lower"] = data["SMA_20"] - 2 * rolling_std
-        true_range = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-        data["ATR_14"] = true_range.rolling(14, min_periods=14).mean()
-        lowest_low = low.rolling(14, min_periods=14).min()
-        highest_high = high.rolling(14, min_periods=14).max()
-        data["Stochastic_K"] = 100 * (close - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
-        data["Return_1D"] = close.pct_change()
-        data["Volatility_20D"] = data["Return_1D"].rolling(20, min_periods=20).std()
-        if volume is not None and not volume.dropna().empty:
-            data["OBV"] = (np.sign(close.diff()).fillna(0) * volume.fillna(0)).cumsum()
-        return data
+        return features.build_features(data)
 
     def _fetch_external_series(self):
-        """Fetch optional Yahoo/FRED series and align them to the market index.
+        """Fetch the selected macro series and align them to the market calendar.
 
-        Forward filling is appropriate for lower-frequency macro data. The final
-        backward fill only handles leading gaps where the selected series starts
-        after the requested market history begins.
+        Forward fill only. The previous version also back-filled, which writes a
+        series' first known value into every earlier date - future information
+        sitting in the training window. Leading gaps stay NaN and the rows that
+        cannot support the full covariate set are reported instead.
         """
-        selected = [label for label, variable in self.external_source_vars.items() if variable.get()]
+        selected = self._selected_macro_labels()
+
         custom_sources = [item.strip() for item in self.custom_source_var.get().split(",") if item.strip()]
         for item in custom_sources:
             try:
@@ -906,24 +955,83 @@ class TimesFMApp:
                 selected.append(label)
             except ValueError:
                 raise ValueError(f"Invalid custom source '{item}'. Use yahoo:SYMBOL or fred:SERIES_ID.")
+
         if not selected:
             return
+
         market_index = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
         if market_index.tz is not None:
             market_index = market_index.tz_localize(None)
-        for label in selected:
+
+        failures = []
+        for position, label in enumerate(selected, start=1):
             source_type, symbol = self.external_sources[label]
-            if source_type == "yahoo":
-                series = yf.download(symbol, period=self.period_var.get(), interval=self.interval_var.get(), progress=False, timeout=10)
-                if isinstance(series.columns, pd.MultiIndex):
-                    series.columns = series.columns.get_level_values(0)
-                series = series["Close"]
+            self.root.after(0, self.log_message,
+                            f"Covariate {position}/{len(selected)}: {label} ({source_type}:{symbol})")
+            try:
+                series = self._download_external(source_type, symbol)
+                self.historical_data[label] = features.align_external(
+                    series, market_index, label
+                ).to_numpy()
+            except Exception as error:
+                # One bad ticker must not lose the other nineteen.
+                failures.append(f"{label} ({str(error)[:60]})")
+
+        if failures:
+            self.root.after(0, self.log_message,
+                            f"{len(failures)} covariate(s) unavailable and skipped: "
+                            + "; ".join(failures), "warning")
+
+        loaded = [label for label in selected if label in self.historical_data.columns]
+        if loaded:
+            coverage = self.historical_data[loaded].notna().all(axis=1).sum()
+            self.root.after(0, self.log_message,
+                            f"{len(loaded)} covariate(s) aligned; {coverage} of "
+                            f"{len(market_index)} bars have all of them present.")
+
+    def _download_external(self, source_type, symbol):
+        """One external series as a float Series indexed by date."""
+        if source_type == "yahoo":
+            frame = yf.download(symbol, period=self.period_var.get(),
+                                interval=self.interval_var.get(),
+                                progress=False, timeout=30, auto_adjust=False)
+            if frame is None or frame.empty:
+                raise ValueError("no data returned")
+            if isinstance(frame.columns, pd.MultiIndex):
+                frame.columns = frame.columns.get_level_values(0)
+            column = "Adj Close" if "Adj Close" in frame.columns else "Close"
+            return frame[column]
+
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={quote(symbol)}"
+        frame = pd.read_csv(url)
+        if frame.shape[1] < 2:
+            raise ValueError("unexpected FRED response")
+        # FRED renamed its date column from DATE to observation_date, and writes
+        # missing observations as a bare '.', which would otherwise import as text.
+        frame = frame.set_index(frame.columns[0])
+        frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index))
+        values = pd.to_numeric(frame.iloc[:, 0], errors="coerce").dropna()
+        if values.empty:
+            raise ValueError("no numeric observations")
+        return values
+
+    def _apply_macro_preset(self, preset):
+        for label, variable in self.external_source_vars.items():
+            if preset == "all":
+                variable.set(True)
+            elif preset == "none":
+                variable.set(False)
             else:
-                url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={quote(symbol)}"
-                series = pd.read_csv(url, index_col=0, parse_dates=True)[symbol]
-            series.index = pd.DatetimeIndex(pd.to_datetime(series.index)).tz_localize(None)
-            aligned = pd.Series(series, index=series.index).reindex(market_index).ffill().bfill()
-            self.historical_data[label] = aligned.to_numpy()
+                variable.set(label in features.DEFAULT_MACRO_SELECTION)
+        self._update_macro_count()
+
+    def _selected_macro_labels(self):
+        return [label for label, variable in self.external_source_vars.items() if variable.get()]
+
+    def _update_macro_count(self):
+        if hasattr(self, "macro_count_label"):
+            count = len(self._selected_macro_labels())
+            self.macro_count_label.config(text=f"{count} of {len(self.external_source_vars)} selected")
 
     def _refresh_feature_controls(self):
         """Refresh target and covariate choices after the feature table changes."""
@@ -953,18 +1061,112 @@ class TimesFMApp:
         return context[-context_len:]
 
     def _prepare_covariate_context(self, end_index, context_len, selected_covariates):
-        """Prepare historical-only covariates with the same time axis as the target."""
+        """Historical-only covariates on the target's time axis, standardised.
+
+        Forward fill only. The previous version interpolated with
+        limit_direction="both", which reconstructs an earlier value from a later
+        one; even inside the context that misrepresents what was knowable at
+        each timestamp. Remaining leading gaps are left NaN here and land on the
+        context mean once standardised.
+
+        Standardisation matters once there are more than a couple of covariates:
+        a policy rate near 50, USDTRY near 40 and a share price near 400 are not
+        comparable magnitudes, and without scaling the largest column dominates
+        regardless of how much information it carries. Statistics come from the
+        context window itself, so this stays leak-free at every origin.
+        """
         covariate_context = []
+        self.covariate_names_used = []
         for column in selected_covariates:
             values = pd.to_numeric(self.historical_data[column], errors="coerce").to_numpy(dtype=float)
             values = values[:end_index]
             if not np.isfinite(values).any():
                 continue
-            values = pd.Series(values).interpolate(limit_direction="both").ffill().bfill().to_numpy()
+            values = pd.Series(values).ffill().to_numpy()
             if len(values) < context_len:
                 values = np.pad(values, (context_len - len(values), 0), mode="edge")
             covariate_context.append(values[-context_len:])
-        return np.asarray(covariate_context, dtype=np.float32) if covariate_context else None
+            self.covariate_names_used.append(column)
+
+        if not covariate_context:
+            return None
+        return features.standardize_context(np.asarray(covariate_context, dtype=np.float32))
+
+    def _model_request_config(self, context_len=None, horizon=None):
+        config = {
+            "repo": self.repo_var.get(),
+            "backend": self.backend_var.get(),
+            "mode": EVALUATOR_MODE,
+        }
+        if EVALUATOR_MODE != "timesfm3":
+            # Only the legacy constructor bakes these in.
+            config["context_len"] = context_len
+            config["horizon"] = horizon
+        return config
+
+    def _ensure_model_loaded(self, config, context_len, horizon, input_patch_len=32):
+        """Load the model if it is not already loaded for this configuration.
+
+        Guarded by a lock because startup autoload and a manual Run Forecast can
+        both reach it, and loading the same weights twice is how you run out of
+        memory.
+        """
+        with self.model_lock:
+            if self.loaded_model is not None and self.current_model_config == config:
+                return False
+
+            self.root.after(0, self.log_message,
+                            f"Loading TimesFM from {config['repo']} (this takes time)...")
+
+            device_target = config["backend"]
+            if sys.platform == "darwin" and device_target == "gpu":
+                device_target = "mps"
+                self.root.after(0, self.log_message, "macOS detected: mapped GPU to Apple MPS.")
+
+            if EVALUATOR_MODE == "timesfm3":
+                model_config = ModelConfig(
+                    checkpoint_path=config["repo"],
+                    device=device_target,
+                    per_core_batch_size=1,
+                )
+                self.loaded_model = TimesFM3Evaluator(model_config)
+            else:
+                self.loaded_model = timesfm.TimesFm(
+                    context_len=context_len,
+                    horizon_len=horizon,
+                    input_patch_len=input_patch_len,
+                    output_patch_len=128,
+                    num_layers=20,
+                    model_dims=1280,
+                    backend=device_target,
+                )
+                self.loaded_model.load_from_checkpoint(repo_id=config["repo"])
+
+            self.current_model_config = config
+            return True
+
+    def _autoload_model_job(self):
+        if not TIMESFM_AVAILABLE:
+            self.root.after(0, self._set_model_status, "timesfm not installed", "error")
+            return
+        try:
+            self.root.after(0, self._set_model_status, "Loading TimesFM 3.0...", "info")
+            config = self._model_request_config(self.context_len_var.get(), self.horizon_var.get())
+            self._ensure_model_loaded(config, self.context_len_var.get(), self.horizon_var.get())
+            label = os.path.basename(config["repo"].rstrip("/")) or config["repo"]
+            self.root.after(0, self._set_model_status, f"Ready: {label}", "info")
+            self.root.after(0, self.log_message, "TimesFM 3.0 loaded and ready.")
+        except Exception as e:
+            # A failed preload must not stop the app: forecasting will retry.
+            self.root.after(0, self._set_model_status, "Load failed (will retry on Run)", "error")
+            self.root.after(0, self.log_message,
+                            f"Model preload failed: {str(e)}. It will be retried on the first forecast.",
+                            "warning")
+
+    def _set_model_status(self, text, level="info"):
+        colour = {"error": "#b00020", "info": "#0a7d28"}.get(level, "#333333")
+        if hasattr(self, "model_status_label"):
+            self.model_status_label.config(text=f"Model: {text}", foreground=colour)
 
     def _predict_loaded_model(self, input_context, covariate_array, horizon,
                               want_quantiles=False):
@@ -1192,48 +1394,9 @@ class TimesFMApp:
                 raise ImportError("timesfm library is not available. Cannot run forecast.")
                 
             # IMPLEMENT MODEL CACHING TO PREVENT OOM CRASHES AND HEAVY BOTTLENECKS
-            current_request_config = {
-                "repo": self.repo_var.get(),
-                "backend": self.backend_var.get(),
-                "mode": EVALUATOR_MODE,
-            }
-            if EVALUATOR_MODE != "timesfm3":
-                # Only the legacy constructor bakes these in. Keying on them in
-                # timesfm3 mode forced a reload whenever the horizon moved.
-                current_request_config["context_len"] = context_len
-                current_request_config["horizon"] = horizon
-            
-            if self.loaded_model is None or self.current_model_config != current_request_config:
-                self.root.after(0, self.log_message, f"Hardware loading TimesFM Model from {current_request_config['repo']} (this takes time)...")
-                
-                device_target = current_request_config["backend"]
-                import sys
-                if sys.platform == "darwin" and device_target == "gpu":
-                    device_target = "mps"
-                    self.root.after(0, self.log_message, "macOS detected: Mapped GPU to Apple MPS.")
-                
-                if EVALUATOR_MODE == "timesfm3":
-                    # Actual TimesFM 3.0 Configuration
-                    config = ModelConfig(
-                        checkpoint_path=current_request_config["repo"],
-                        device=device_target,
-                        per_core_batch_size=1
-                    )
-                    self.loaded_model = TimesFM3Evaluator(config)
-                else:
-                    self.loaded_model = timesfm.TimesFm(
-                        context_len=context_len,
-                        horizon_len=horizon,
-                        input_patch_len=input_patch_len,
-                        output_patch_len=128,
-                        num_layers=20,
-                        model_dims=1280,
-                        backend=device_target
-                    )
-                    self.loaded_model.load_from_checkpoint(repo_id=current_request_config["repo"])
-                    
-                self.current_model_config = current_request_config
-            else:
+            current_request_config = self._model_request_config(context_len, horizon)
+
+            if not self._ensure_model_loaded(current_request_config, context_len, horizon, input_patch_len):
                 self.root.after(0, self.log_message, "Using cached model weights in VRAM/RAM...")
             
             self.root.after(0, self.log_message, "Running inference on prepared context data...")
@@ -1333,6 +1496,8 @@ class TimesFMApp:
                 mae_score=None,
                 anchor_date=anchor.isoformat(),
                 quantiles=self.forecast_quantiles,
+                feature_columns=getattr(self, "covariate_names_used", None) or self._selected_covariates(),
+                target_space=self.forecast_space,
             )
             self.log_message("Forecast results saved to database successfully.")
 
@@ -1347,11 +1512,10 @@ class TimesFMApp:
                         if np.isfinite(value)
                     ), "warning"
                 )
-            if self._selected_covariates():
-                self.log_message(
-                    f"Covariates used but not recorded: {', '.join(self._selected_covariates())} "
-                    "(schema has no feature_columns column).", "warning"
-                )
+            used = getattr(self, "covariate_names_used", None) or self._selected_covariates()
+            if used:
+                self.log_message(f"Recorded {len(used)} covariate(s) with the run: {', '.join(used[:6])}"
+                                 + (" ..." if len(used) > 6 else ""))
             self.refresh_forecast_history()
         except Exception as db_e:
             self.log_message(f"Database save failed: {str(db_e)}", "error")
@@ -1700,7 +1864,7 @@ class TimesFMApp:
 
     def scan_local_models(self):
         self.model_listbox.delete(0, tk.END)
-        models_dir = "./models"
+        models_dir = MODELS_DIR
         os.makedirs(models_dir, exist_ok=True)
         
         found_models = False
@@ -1721,7 +1885,7 @@ class TimesFMApp:
         model_folder = self.model_listbox.get(selection[0])
         if model_folder.startswith("("): return # Ignore the "None found" placeholder
         
-        full_path = os.path.abspath(os.path.join("./models", model_folder))
+        full_path = os.path.abspath(os.path.join(MODELS_DIR, model_folder))
         self.repo_var.set(full_path)
         self.log_message(f"Active model set to local path: {full_path}")
         messagebox.showinfo("Model Updated", f"App will now load weights from:\n{full_path}")

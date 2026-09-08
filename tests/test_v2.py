@@ -19,7 +19,7 @@ c.execute('INSERT INTO forecast_runs (ticker,interval,context_length,horizon_len
           ('OLD.IS','1d',1056,3,'repo','max',pickle.dumps([1.,2.,3.]),0.5))
 c.commit(); c.close()
 db.init_db(); db.init_db()
-assert uv()==2, uv()
+assert uv()==3, uv()
 r=db.get_forecast_by_id(1)
 assert r['forecast_data']==[1.,2.,3.] and r['mae_score']==0.5 and r['quantiles'] is None
 assert r['mase_score'] is None
@@ -63,3 +63,22 @@ assert db.delete_backtest_run(rid) is False
 print("cascade delete OK")
 shutil.rmtree(t)
 print("\nALL V2 TESTS PASSED")
+
+# ---- v3: covariate provenance ----------------------------------------
+import tempfile as _tf, os as _os
+_t2 = _tf.mkdtemp(); db.DB_DIR = _t2; db.DB_PATH = _os.path.join(_t2, 'v3.db')
+db.init_db()
+covariates = ["USD/TRY", "Brent crude", "TR policy rate (CBRT)", "VIX"]
+fid = db.insert_forecast('ASELS.IS', '1d', 1056, 7, 'repo', 'max', [1.0, 2.0],
+                         target_column='Close', anchor_date='2026-09-04T00:00:00',
+                         feature_columns=covariates, target_space='log_return')
+rec = db.get_forecast_by_id(fid)
+assert rec['feature_columns'] == covariates, rec['feature_columns']
+assert rec['target_space'] == 'log_return'
+hist = [r for r in db.get_forecast_history() if r['id'] == fid][0]
+assert hist['feature_columns'] == covariates
+# a run saved without covariates must read back as an empty list, never None
+plain = db.get_forecast_by_id(db.insert_forecast('X.IS','1d',64,2,'r','1y',[1.0]))
+assert plain['feature_columns'] == [] and plain['target_space'] is None
+print(f"v3 OK: {len(covariates)} covariates round-trip, empty case is []")
+print("\nALL V2/V3 TESTS PASSED")

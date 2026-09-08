@@ -173,12 +173,27 @@ def plan_origins(n_observations, context_len, horizon, step, min_context=None):
 
 def walk_forward(values, dates, model_fn, context_len, horizon, step,
                  mode="sliding", min_context=None, quantile_levels=None,
-                 progress_cb=None, should_stop=None):
-    """Roll an origin through history. Returns a list of per-step dicts."""
+                 progress_cb=None, should_stop=None, covariates=None):
+    """Roll an origin through history. Returns a list of per-step dicts.
+
+    `covariates` is an optional (n_features, n_observations) matrix aligned to
+    `values`. It is re-sliced at every origin exactly like the target, so the
+    covariate window never reaches past the origin either. A model_fn receives
+    it only when it declares `wants_covariates = True`, which keeps the plain
+    baselines on the simple two-argument contract.
+    """
     values = np.asarray(values, dtype=float).reshape(-1)
     dates = pd.DatetimeIndex(dates)
     if values.size != dates.size:
         raise ValueError("values and dates must be the same length")
+
+    if covariates is not None:
+        covariates = np.asarray(covariates, dtype=float)
+        if covariates.ndim != 2 or covariates.shape[1] != values.size:
+            raise ValueError(
+                f"covariates must be (n_features, {values.size}), got {covariates.shape}"
+            )
+    wants_covariates = bool(getattr(model_fn, "wants_covariates", False))
 
     origins = plan_origins(values.size, context_len, horizon, step, min_context)
     if not origins:
@@ -196,7 +211,15 @@ def walk_forward(values, dates, model_fn, context_len, horizon, step,
         if mode == "sliding":
             context = context[-context_len:]
 
-        point, quantiles = model_fn(context, horizon)
+        if wants_covariates:
+            covariate_window = None
+            if covariates is not None:
+                covariate_window = covariates[:, :origin + 1]
+                if mode == "sliding":
+                    covariate_window = covariate_window[:, -context_len:]
+            point, quantiles = model_fn(context, horizon, covariate_window)
+        else:
+            point, quantiles = model_fn(context, horizon)
         point = np.asarray(point, dtype=float).reshape(-1)[:horizon]
 
         truth = values[origin + 1: origin + 1 + horizon]

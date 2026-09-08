@@ -31,7 +31,7 @@ for i, vals in enumerate([[1.0,2.0,3.0], [9.5,8.25]], start=1):
 c.commit(); c.close()
 
 db.init_db(); db.init_db()          # migrate, then prove idempotent
-assert uv() == 2, uv()
+assert uv() == 3, uv()
 ty = types_of()
 assert ty['period'] == 'TEXT', ty['period']
 assert ty['forecast_data'] == 'TEXT', ty['forecast_data']
@@ -57,14 +57,14 @@ db.init_db()
 r = db.get_forecast_by_id(1)
 assert r['forecast_data'] == [5.0,6.0,7.0] and r['mae_score'] == 0.42
 assert r['target_column'] == 'Close' and r['anchor_date'] == '2026-09-04T00:00:00'
-assert types_of()["period"] == "TEXT" and uv() == 2
+assert types_of()["period"] == "TEXT" and uv() == 3
 print("PATH B (columns present, still pickle) OK; mae/anchor/target preserved")
 shutil.rmtree(t)
 
 # ---- PATH C: brand new database ---------------------------------------
 t = fresh_tmp()
 db.init_db()
-assert uv() == 2 and types_of()['forecast_data'] == 'TEXT'
+assert uv() == 3 and types_of()['forecast_data'] == 'TEXT'
 new_id = db.insert_forecast('ASELS.IS','1d',1056,3,'repo','max',[10.5,11.0,10.75],
                             target_column='Close', anchor_date='2026-09-04T00:00:00')
 assert new_id == 1

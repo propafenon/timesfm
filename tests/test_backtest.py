@@ -96,4 +96,41 @@ print("\nPER-STEP (naive on a random walk) - MASE must grow like sqrt(h):")
 for r in s5["by_step"]:
     print(f"  h={r['step']}  MASE={r['mase']:.3f}  expected~{np.sqrt(r['step']):.3f}  skill={r['skill_vs_naive']:+.1e}")
 assert abs(s5["by_step"][0]["mase"]-1.0)<0.25, s5["by_step"][0]["mase"]
+
+# ---- COVARIATE walk-forward: the window must not reach past the origin ----
+n2 = 300
+vals2 = np.arange(100.0, 100.0 + n2)
+dates2 = pd.bdate_range("2024-01-02", periods=n2)
+# three covariates; everything at/after index 200 is poison
+cov = np.vstack([np.arange(n2) * 1.0, np.arange(n2) * 2.0, np.arange(n2) * 3.0])
+cov[:, 200:] = 9e9
+
+seen = []
+def cov_spy(context, horizon, covariate_window=None):
+    assert covariate_window is not None, "covariates were not delivered"
+    seen.append((len(context), covariate_window.shape, float(np.max(covariate_window))))
+    return np.full(horizon, float(context[-1])), None
+cov_spy.wants_covariates = True
+
+crows = bt.walk_forward(vals2, dates2, cov_spy, context_len=64, horizon=5, step=9,
+                        covariates=cov)
+origins2 = bt.plan_origins(n2, 64, 5, 9)
+for origin, (clen, shape, mx) in zip(origins2, seen):
+    assert shape == (3, clen), f"covariate window {shape} misaligned with context {clen}"
+    assert mx <= cov[:, :origin + 1].max() + 1e-6, f"origin {origin} saw covariate {mx}"
+print(f"COVARIATE NO-LEAKAGE: {len(seen)} origins, window always (3, context) and never past the origin")
+
+# a model that does not declare wants_covariates keeps the 2-arg contract
+plain_rows = bt.walk_forward(vals2, dates2, bt.naive, 64, 5, 9, covariates=cov)
+assert len(plain_rows) == len(crows)
+print("baselines still use the two-argument contract")
+
+# shape mistakes are refused loudly rather than silently broadcast
+try:
+    bt.walk_forward(vals2, dates2, cov_spy, 64, 5, 9, covariates=cov[:, :100])
+    raise AssertionError("should have refused a misaligned covariate matrix")
+except ValueError as error:
+    message = str(error)          # the name is unbound after the except block
+    assert "covariates must be" in message
+print("misaligned covariate matrix is refused:", message[:60])
 print("\nALL BACKTEST TESTS PASSED")

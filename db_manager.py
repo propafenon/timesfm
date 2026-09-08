@@ -11,14 +11,14 @@ DB_PATH = os.path.join(DB_DIR, 'forecast_history.db')
 
 # Bumped whenever the schema or the blob encoding changes. Tracked in SQLite's
 # own PRAGMA user_version so migrations run once, not on every startup.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Everything the history grid displays. The forecast blob is deliberately absent
 # so listing runs does not decode every forecast ever saved.
 METADATA_COLUMNS = (
     'id', 'timestamp', 'ticker', 'interval', 'context_length', 'horizon_length',
     'model_repo', 'period', 'target_column', 'anchor_date', 'mae_score',
-    'mase_score', 'directional_accuracy',
+    'mase_score', 'directional_accuracy', 'feature_columns', 'target_space',
 )
 
 BACKTEST_RUN_COLUMNS = (
@@ -81,7 +81,9 @@ _CREATE_TABLE = '''
         anchor_date TEXT,
         quantiles TEXT,
         mase_score REAL,
-        directional_accuracy REAL
+        directional_accuracy REAL,
+        feature_columns TEXT,
+        target_space TEXT
     )
 '''
 
@@ -186,6 +188,19 @@ def _migrate_to_v2(conn):
             conn.execute(f'ALTER TABLE forecast_runs ADD COLUMN {column} {decl}')
 
 
+def _migrate_to_v3(conn):
+    """Record the covariate recipe and modelling space alongside each run.
+
+    Without feature_columns a saved forecast cannot say which of the ~27
+    available macro series it was conditioned on, which makes runs impossible
+    to reproduce or compare once more than a couple of covariates are in play.
+    """
+    existing = {row[1] for row in conn.execute('PRAGMA table_info(forecast_runs)')}
+    for column in ('feature_columns', 'target_space'):
+        if column not in existing:
+            conn.execute(f'ALTER TABLE forecast_runs ADD COLUMN {column} TEXT')
+
+
 def init_db():
     with _connect() as conn:
         conn.execute('PRAGMA foreign_keys = ON')
@@ -198,6 +213,8 @@ def init_db():
                 _migrate_to_v1(conn)
             if version < 2:
                 _migrate_to_v2(conn)
+            if version < 3:
+                _migrate_to_v3(conn)
 
         conn.execute(_CREATE_BACKTEST_RUNS)
         conn.execute(_CREATE_BACKTEST_POINTS)
@@ -214,7 +231,8 @@ def init_db():
 
 def insert_forecast(ticker, interval, context_length, horizon_length, model_repo,
                     period, forecast_data, mae_score=None, target_column=None,
-                    anchor_date=None, quantiles=None):
+                    anchor_date=None, quantiles=None, feature_columns=None,
+                    target_space=None):
     """Persist one run.
 
     anchor_date is the timestamp of the last historical observation the forecast
@@ -226,11 +244,13 @@ def insert_forecast(ticker, interval, context_length, horizon_length, model_repo
             INSERT INTO forecast_runs (
                 ticker, interval, context_length, horizon_length, model_repo,
                 period, forecast_data, mae_score, target_column, anchor_date,
-                quantiles
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                quantiles, feature_columns, target_space
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (ticker, interval, context_length, horizon_length, model_repo, period,
               _encode(forecast_data), mae_score, target_column, anchor_date,
-              json.dumps(quantiles) if quantiles is not None else None))
+              json.dumps(quantiles) if quantiles is not None else None,
+              json.dumps(list(feature_columns)) if feature_columns else None,
+              target_space))
         return cursor.lastrowid
 
 
@@ -242,7 +262,10 @@ def get_forecast_history():
             f'SELECT {columns} FROM forecast_runs ORDER BY timestamp DESC'
         ).fetchall()
 
-    return [dict(zip(METADATA_COLUMNS, row)) for row in rows]
+    records = [dict(zip(METADATA_COLUMNS, row)) for row in rows]
+    for record in records:
+        record['feature_columns'] = _load_list(record.get('feature_columns'))
+    return records
 
 
 def get_forecast_by_id(forecast_id):
@@ -263,7 +286,18 @@ def get_forecast_by_id(forecast_id):
         record['quantiles'] = json.loads(row[-1]) if row[-1] else None
     except (ValueError, TypeError):
         record['quantiles'] = None
+    record['feature_columns'] = _load_list(record.get('feature_columns'))
     return record
+
+
+def _load_list(value):
+    if not value:
+        return []
+    try:
+        loaded = json.loads(value)
+    except (ValueError, TypeError):
+        return []
+    return loaded if isinstance(loaded, list) else []
 
 
 def update_scores(forecast_id, mae_score=None, mase_score=None,
