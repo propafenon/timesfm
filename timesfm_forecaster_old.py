@@ -6,7 +6,8 @@ import traceback
 import numpy as np
 import pandas as pd
 import db_manager
-import uuid
+import csv
+import sys
 
 try:
     import yfinance as yf
@@ -165,6 +166,8 @@ class TimesFMApp:
         self.log_frame.grid(row=1, column=0, sticky="nsew")
         
         self.log_text = tk.Text(self.log_frame, state='disabled', wrap='word', height=8, bg="#1e1e1e", fg="#00ff00", font=("Consolas", 10))
+        self.log_text.tag_config("warning", foreground="#ffb000")
+        self.log_text.tag_config("error", foreground="#ff5555")
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         self.init_plot()
@@ -266,22 +269,23 @@ class TimesFMApp:
 
     def log_message(self, message, level="info"):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        formatted_msg = f"[{timestamp}] {message}\n"
-        
+        prefix = {"warning": "WARN ", "error": "ERROR "}.get(level, "")
+        formatted_msg = f"[{timestamp}] {prefix}{message}\n"
+
         self.log_text.config(state='normal')
-        self.log_text.insert(tk.END, formatted_msg)
+        # Levels were accepted but ignored, so warnings and errors were
+        # indistinguishable from ordinary chatter.
+        self.log_text.insert(tk.END, formatted_msg, level if level in ("warning", "error") else ())
         self.log_text.see(tk.END)
         self.log_text.config(state='disabled')
-        self.root.update_idletasks()
+        # No update_idletasks() here: log_message runs inside after() callbacks,
+        # and pumping the event loop from one invites re-entrant redraws.
 
     def set_processing_state(self, state):
         self.is_processing = state
-        if state:
-            self.fetch_btn.state(['disabled'])
-            self.run_btn.state(['disabled'])
-        else:
-            self.fetch_btn.state(['!disabled'])
-            self.run_btn.state(['!disabled'])
+        flag = 'disabled' if state else '!disabled'
+        for button in (self.fetch_btn, self.run_btn, self.insert_db_btn, self.save_btn):
+            button.state([flag])
 
     def thread_fetch_data(self):
         if self.is_processing: return
@@ -315,6 +319,13 @@ class TimesFMApp:
     def _on_fetch_success(self):
         self.log_message(f"Successfully fetched {len(self.historical_data)} data points.")
         self.overlay_forecasts.clear()
+        # The live forecast belongs to the series it was run against. Keeping it
+        # after a refetch left a stale curve on the chart with no way to tell.
+        if self.forecast_data is not None:
+            self.forecast_data = None
+            self.forecast_anchor = None
+            self.forecast_target_col = None
+            self.log_message("Cleared the previous forecast; re-run it against the new data.", "warning")
         self.update_plot()
         self.set_processing_state(False)
 
@@ -338,8 +349,16 @@ class TimesFMApp:
             
             if np.isnan(time_series).all():
                 raise ValueError(f"The column '{target_col}' contains only invalid/NaN data.")
-            
-            time_series = np.nan_to_num(time_series, nan=np.nanmean(time_series))
+
+            gaps = int(np.isnan(time_series).sum())
+            if gaps:
+                # Carry the last observed price across gaps (and back-fill any
+                # leading ones). Imputing the series mean, as this used to do,
+                # injects prices that never traded anywhere near those dates.
+                time_series = pd.Series(time_series).ffill().bfill().to_numpy()
+                self.root.after(0, self.log_message,
+                                f"Filled {gaps} missing value(s) in '{target_col}' by carrying prices forward.",
+                                "warning")
             
             context_len = self.context_len_var.get()
             horizon = self.horizon_var.get()
@@ -368,16 +387,20 @@ class TimesFMApp:
             # IMPLEMENT MODEL CACHING TO PREVENT OOM CRASHES AND HEAVY BOTTLENECKS
             current_request_config = {
                 "repo": self.repo_var.get(),
-                "context_len": context_len,
-                "horizon": horizon,
-                "backend": self.backend_var.get()
+                "backend": self.backend_var.get(),
+                "mode": EVALUATOR_MODE,
             }
+            if EVALUATOR_MODE != "timesfm3":
+                # Only the legacy constructor bakes these in. Keying on them in
+                # timesfm3 mode forced a full reload whenever the horizon moved,
+                # even though ModelConfig never sees them.
+                current_request_config["context_len"] = context_len
+                current_request_config["horizon"] = horizon
             
             if self.loaded_model is None or self.current_model_config != current_request_config:
                 self.root.after(0, self.log_message, f"Hardware loading TimesFM Model from {current_request_config['repo']} (this takes time)...")
                 
                 device_target = current_request_config["backend"]
-                import sys
                 if sys.platform == "darwin" and device_target == "gpu":
                     device_target = "mps"
                     self.root.after(0, self.log_message, "macOS detected: Mapped GPU to Apple MPS.")
@@ -490,8 +513,11 @@ class TimesFMApp:
         return series[~series.index.duplicated(keep="last")]
 
     def _on_process_error(self, error_msg):
-        self.log_message(f"ERROR: {error_msg}")
-        messagebox.showerror("Process Error", str(error_msg))
+        self.log_message(str(error_msg), "error")
+        # The dialog used to carry the whole traceback, which pushed the actual
+        # message off screen. The log keeps the full text.
+        headline = str(error_msg).strip().splitlines()[0] if str(error_msg).strip() else "Unknown error"
+        messagebox.showerror("Process Error", headline)
         self.set_processing_state(False)
 
     def _get_forecast_dates(self, last_date, interval, length):
@@ -541,7 +567,13 @@ class TimesFMApp:
 
         prices = np.asarray(self.historical_data[target], dtype=float).reshape(-1)
         if len(dates) != len(prices):
-            raise ValueError("Historical dates and prices have different lengths.")
+            # Raising here escaped into Tk's callback machinery and only ever
+            # reached stderr, leaving the user with a silently stale plot.
+            self.log_message(
+                f"Cannot plot: {len(dates)} dates against {len(prices)} prices.", "error"
+            )
+            self.canvas.draw()
+            return
 
         self.ax.plot(dates, prices, label="Historical Data", color="blue", linewidth=1.5)
         last_date = dates[-1]
@@ -550,12 +582,20 @@ class TimesFMApp:
         if self.forecast_data is not None:
             forecast_values = np.asarray(self.forecast_data, dtype=float).reshape(-1)
             if forecast_values.size:
+                live_anchor = last_date
+                live_price = last_price
+                if self.forecast_anchor is not None:
+                    live_anchor = pd.Timestamp(self.forecast_anchor)
+                    if live_anchor.tzinfo is not None:
+                        live_anchor = live_anchor.tz_localize(None)
+                    live_price = float(pd.Series(prices, index=dates).get(live_anchor, last_price))
+
                 forecast_dates = self._get_forecast_dates(
-                    last_date, self.interval_var.get(), forecast_values.size
+                    live_anchor, self.interval_var.get(), forecast_values.size
                 )
                 self.ax.plot(
-                    pd.DatetimeIndex([last_date]).append(forecast_dates),
-                    np.concatenate(([last_price], forecast_values)),
+                    pd.DatetimeIndex([live_anchor]).append(forecast_dates),
+                    np.concatenate(([live_price], forecast_values)),
                     label="TimesFM Forecast",
                     color="orange",
                     linewidth=2,
@@ -612,9 +652,8 @@ class TimesFMApp:
             messagebox.showinfo("Export", "No complete forecast data to export. Run a forecast first.")
             return
             
-        import csv
         from tkinter import filedialog
-        
+
         filepath = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV Files", "*.csv")],
@@ -625,15 +664,32 @@ class TimesFMApp:
             return
             
         try:
+            target = self.forecast_target_col or self.target_col_var.get()
+            forecast_values = np.asarray(self.forecast_data, dtype=float).reshape(-1)
+
+            dates = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
+            if dates.tz is not None:
+                dates = dates.tz_localize(None)
+            anchor = pd.Timestamp(self.forecast_anchor) if self.forecast_anchor is not None else dates[-1]
+            if anchor.tzinfo is not None:
+                anchor = anchor.tz_localize(None)
+            forecast_dates = self._get_forecast_dates(
+                anchor, self.interval_var.get(), forecast_values.size
+            )
+
             with open(filepath, 'w', newline='', encoding='utf-8') as file:
                 writer = csv.writer(file)
-                writer.writerow(["Type", "Step", "Forecast_Value"])
-                for i, val in enumerate(self.forecast_data):
-                    writer.writerow(["Forecast", i+1, val])
-            
+                writer.writerow(["Type", "Date", "Step", target])
+                # Dated history alongside the forecast, so the file can be
+                # reconciled against actuals later without guessing the anchor.
+                for date, value in zip(dates, np.asarray(self.historical_data[target], dtype=float).reshape(-1)):
+                    writer.writerow(["Historical", date.isoformat(), "", value])
+                for step, (date, value) in enumerate(zip(forecast_dates, forecast_values), start=1):
+                    writer.writerow(["Forecast", date.isoformat(), step, value])
+
             self.log_message(f"Forecast successfully exported to {filepath}")
         except Exception as e:
-            self.log_message(f"Export Error: {str(e)}")
+            self.log_message(f"Export Error: {str(e)}", "error")
 
     def refresh_forecast_history(self):
         """Reload the history grid. Safe to call from the UI thread."""
