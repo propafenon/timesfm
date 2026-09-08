@@ -1,5 +1,6 @@
 import sqlite3 as sq3
 import os
+import json
 import pickle
 from contextlib import contextmanager
 
@@ -8,12 +9,33 @@ from contextlib import contextmanager
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runs')
 DB_PATH = os.path.join(DB_DIR, 'forecast_history.db')
 
+# Bumped whenever the schema or the blob encoding changes. Tracked in SQLite's
+# own PRAGMA user_version so migrations run once, not on every startup.
+SCHEMA_VERSION = 1
+
 # Everything the history grid displays. The forecast blob is deliberately absent
-# so listing runs does not unpickle every forecast ever saved.
+# so listing runs does not decode every forecast ever saved.
 METADATA_COLUMNS = (
     'id', 'timestamp', 'ticker', 'interval', 'context_length', 'horizon_length',
     'model_repo', 'period', 'target_column', 'anchor_date', 'mae_score',
 )
+
+_CREATE_TABLE = '''
+    CREATE TABLE IF NOT EXISTS forecast_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        ticker TEXT NOT NULL,
+        interval TEXT NOT NULL,
+        context_length INTEGER NOT NULL,
+        horizon_length INTEGER NOT NULL,
+        model_repo TEXT NOT NULL,
+        period TEXT NOT NULL,
+        forecast_data TEXT NOT NULL,
+        mae_score REAL,
+        target_column TEXT,
+        anchor_date TEXT
+    )
+'''
 
 
 @contextmanager
@@ -28,37 +50,83 @@ def _connect():
         conn.close()
 
 
+def _encode(forecast_data):
+    """Forecasts are plain lists of floats, so JSON is enough.
+
+    It is also inspectable in any SQLite browser and, unlike pickle, decoding it
+    cannot execute code if the file is ever tampered with or shared.
+    """
+    return json.dumps([float(value) for value in forecast_data])
+
+
+def _decode(blob):
+    """Read JSON, falling back to pickle for rows written before the switch."""
+    if isinstance(blob, (bytes, bytearray)):
+        try:
+            blob = blob.decode('utf-8')
+        except UnicodeDecodeError:
+            return pickle.loads(blob)
+    try:
+        return json.loads(blob)
+    except (ValueError, TypeError):
+        return pickle.loads(blob)
+
+
+def _table_exists(conn):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forecast_runs'"
+    ).fetchone() is not None
+
+
+def _migrate_to_v1(conn):
+    """Rebuild the table with correct column types and re-encode blobs as JSON.
+
+    Fixes three things at once, because they all require touching every row:
+      - period was declared INTEGER while holding values like 'max' and '1y'
+      - forecast_data was declared BLOB and held pickle bytes
+      - target_column / anchor_date did not exist
+    """
+    existing = {row[1] for row in conn.execute('PRAGMA table_info(forecast_runs)')}
+    for column in ('target_column', 'anchor_date'):
+        if column not in existing:
+            conn.execute(f'ALTER TABLE forecast_runs ADD COLUMN {column} TEXT')
+
+    conn.execute('ALTER TABLE forecast_runs RENAME TO forecast_runs_legacy')
+    conn.execute(_CREATE_TABLE)
+
+    rows = conn.execute('''
+        SELECT id, timestamp, ticker, interval, context_length, horizon_length,
+               model_repo, period, forecast_data, mae_score, target_column, anchor_date
+        FROM forecast_runs_legacy
+    ''').fetchall()
+
+    for row in rows:
+        values = list(row)
+        values[8] = _encode(_decode(values[8]))
+        conn.execute('''
+            INSERT INTO forecast_runs (
+                id, timestamp, ticker, interval, context_length, horizon_length,
+                model_repo, period, forecast_data, mae_score, target_column, anchor_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', values)
+
+    conn.execute('DROP TABLE forecast_runs_legacy')
+
+
 def init_db():
     with _connect() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS forecast_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                ticker TEXT NOT NULL,
-                interval TEXT NOT NULL,
-                context_length INTEGER NOT NULL,
-                horizon_length INTEGER NOT NULL,
-                model_repo TEXT NOT NULL,
-                period INTEGER NOT NULL,
-                forecast_data BLOB NOT NULL,
-                mae_score REAL,
-                target_column TEXT,
-                anchor_date TEXT
-            )
-        ''')
+        version = conn.execute('PRAGMA user_version').fetchone()[0]
 
-        # Migrate databases written before target_column / anchor_date existed.
-        # Existing rows keep NULL and stay un-scorable, which is honest: we have
-        # no way to recover what they were anchored to.
-        existing = {row[1] for row in conn.execute('PRAGMA table_info(forecast_runs)')}
-        for column in ('target_column', 'anchor_date'):
-            if column not in existing:
-                conn.execute(f'ALTER TABLE forecast_runs ADD COLUMN {column} TEXT')
+        if not _table_exists(conn):
+            conn.execute(_CREATE_TABLE)
+        elif version < 1:
+            _migrate_to_v1(conn)
 
         conn.execute('''
             CREATE INDEX IF NOT EXISTS idx_forecast_runs_ticker_ts
             ON forecast_runs (ticker, timestamp)
         ''')
+        conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
 
 
 def insert_forecast(ticker, interval, context_length, horizon_length, model_repo,
@@ -71,13 +139,14 @@ def insert_forecast(ticker, interval, context_length, horizon_length, model_repo
     and therefore cannot be scored.
     """
     with _connect() as conn:
-        conn.execute('''
+        cursor = conn.execute('''
             INSERT INTO forecast_runs (
                 ticker, interval, context_length, horizon_length, model_repo,
                 period, forecast_data, mae_score, target_column, anchor_date
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (ticker, interval, context_length, horizon_length, model_repo, period,
-              pickle.dumps(forecast_data), mae_score, target_column, anchor_date))
+              _encode(forecast_data), mae_score, target_column, anchor_date))
+        return cursor.lastrowid
 
 
 def get_forecast_history():
@@ -92,7 +161,7 @@ def get_forecast_history():
 
 
 def get_forecast_by_id(forecast_id):
-    """One full run, including the deserialized forecast values."""
+    """One full run, including the decoded forecast values."""
     columns = ', '.join(METADATA_COLUMNS)
     with _connect() as conn:
         row = conn.execute(
@@ -104,7 +173,7 @@ def get_forecast_by_id(forecast_id):
         return None
 
     record = dict(zip(METADATA_COLUMNS, row))
-    record['forecast_data'] = pickle.loads(row[-1])
+    record['forecast_data'] = _decode(row[-1])
     return record
 
 
