@@ -1429,10 +1429,26 @@ class TimesFMApp:
                 context_len = ((context_len // input_patch_len) + 1) * input_patch_len
                 self.root.after(0, self.log_message, f"Adjusted Context Length from {old_len} to {context_len} (must be multiple of {input_patch_len}).")
             
+            # Do NOT pad the series here. The old code padded time_series up to
+            # context_len, which did two bad things: it fed the model a context
+            # that was mostly one repeated edge value (1056 requested against 254
+            # real bars is 76% fabricated), and it made positions in time_series
+            # no longer correspond to rows of historical_data, so the validation
+            # split indexed a 254-row DatetimeIndex with 843. Clamp instead, and
+            # let _prepare_context pad only the slice it hands to the model.
             if len(time_series) < context_len:
-                self.root.after(0, self.log_message, f"Warning: Data length ({len(time_series)}) < context length ({context_len}). Padding data.", "warning")
-                pad_size = context_len - len(time_series)
-                time_series = np.pad(time_series, (pad_size, 0), mode='edge')
+                usable = (len(time_series) // input_patch_len) * input_patch_len
+                if usable >= input_patch_len:
+                    self.root.after(0, self.log_message,
+                                    f"Only {len(time_series)} bars available: context reduced from "
+                                    f"{context_len} to {usable}. Fetch a longer period to use more.",
+                                    "warning")
+                    context_len = usable
+                else:
+                    self.root.after(0, self.log_message,
+                                    f"Only {len(time_series)} bars available, fewer than one "
+                                    f"{input_patch_len}-bar patch; the context will be padded.",
+                                    "warning")
 
             selected_covariates = self._selected_covariates()
 
@@ -1447,15 +1463,27 @@ class TimesFMApp:
                                 "(differencing would misalign the covariate columns by one bar).",
                                 "warning")
             price_series = time_series
+            # series_dates[i] is the timestamp of time_series[i]. Differencing
+            # drops the first observation, so without this map every position
+            # would be off by one against historical_data in return space.
+            frame_index = pd.DatetimeIndex(pd.to_datetime(self.historical_data.index))
+            row_offset = 0
             if space != transforms.PRICE:
                 time_series = transforms.encode(price_series, space)
+                row_offset = 1
                 self.root.after(0, self.log_message,
                                 f"Modelling {transforms.SPACE_LABELS[space].lower()} "
                                 f"({time_series.size} observations after differencing).")
+            series_dates = frame_index[row_offset:]
+            if len(series_dates) != len(time_series):
+                raise ValueError(
+                    f"Internal alignment error: {len(time_series)} values against "
+                    f"{len(series_dates)} dates."
+                )
 
             input_context = self._prepare_context(time_series, len(time_series), context_len)
             covariate_array = self._prepare_covariate_context(
-                len(time_series), context_len, selected_covariates
+                len(time_series) + row_offset, context_len, selected_covariates
             )
             # TimesFM 3 expects one target context and optional covariates as
             # [feature_count, time_steps]; future values are intentionally unknown.
@@ -1471,14 +1499,22 @@ class TimesFMApp:
             
             self.root.after(0, self.log_message, "Running inference on prepared context data...")
 
-            validation_size = max(1, int(np.ceil(len(time_series) * validation_ratio)))
-            split_index = len(time_series) - validation_size
-            if split_index <= 0:
-                raise ValueError("Validation ratio leaves no training observations.")
+            # Computed on the real series length. Previously this used the
+            # padded length, so split_index could point past the end of the data.
+            series_length = len(time_series)
+            validation_size = max(1, int(np.ceil(series_length * validation_ratio)))
+            validation_size = min(validation_size, max(series_length - input_patch_len, 1))
+            split_index = series_length - validation_size
+            if split_index < 1:
+                raise ValueError(
+                    f"Only {series_length} observations: not enough to hold out "
+                    f"{validation_size} for validation. Fetch a longer period or "
+                    "lower the validation ratio."
+                )
             validation_horizon = min(horizon, validation_size)
             validation_context = self._prepare_context(time_series, split_index, context_len)
             validation_covariates = self._prepare_covariate_context(
-                split_index, context_len, selected_covariates
+                split_index + row_offset, context_len, selected_covariates
             )
             validation_prediction = self._predict_loaded_model(
                 validation_context, validation_covariates, validation_horizon
@@ -1490,7 +1526,7 @@ class TimesFMApp:
                 validation_prediction,
                 time_series[split_index - 1],
             )
-            self.validation_origin = pd.Timestamp(self.historical_data.index[split_index - 1]).isoformat()
+            self.validation_origin = pd.Timestamp(series_dates[split_index - 1]).isoformat()
             self.validation_record_saved = False
             self.root.after(
                 0,
@@ -1524,7 +1560,7 @@ class TimesFMApp:
             self.forecast_data = forecast_result
             self.forecast_quantiles = spread
             self.forecast_space = space
-            self.forecast_anchor = self.historical_data.index[-1]
+            self.forecast_anchor = series_dates[-1]
             self.forecast_target_col = target_col
 
             self.root.after(0, self._on_forecast_success)
