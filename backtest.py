@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 import metrics
+import transforms
 
 DEFAULT_QUANTILE_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
@@ -116,6 +117,44 @@ def try_statsforecast_baselines(season_length=5):
 
     return {"auto_arima": _wrap(AutoARIMA, "auto_arima"),
             "auto_ets": _wrap(AutoETS, "auto_ets")}
+
+
+def in_return_space(model_fn, space=transforms.LOG_RETURN):
+    """Run a forecaster on returns while keeping the engine in price space.
+
+    The wrapper takes a price context, converts it, forecasts, and reconstructs
+    a price path. Everything outside sees prices, so a return model and a level
+    model are scored against the same actuals on the same footing - which is the
+    only way the comparison means anything.
+
+    Note this changes what a baseline *is*. `naive` wrapped this way predicts
+    "the last return repeats", which is momentum, not no-change. The engine's
+    naive reference column is the anchor price and is unaffected, so
+    skill_vs_naive keeps its meaning either way.
+    """
+    def _forecast(price_context, horizon):
+        price_context = np.asarray(price_context, dtype=float).reshape(-1)
+        anchor = float(price_context[-1])
+
+        model_context = transforms.encode(price_context, space)
+        point, quantiles = model_fn(model_context, horizon)
+        prices = transforms.decode(point, anchor, space)
+
+        reconstructed = None
+        if quantiles is not None:
+            matrix = np.asarray(quantiles, dtype=float)
+            if matrix.ndim == 2:
+                # Each quantile path compounds separately; decoding the spread
+                # as a block would mix levels across horizon steps.
+                reconstructed = np.column_stack([
+                    transforms.decode(matrix[:, i], anchor, space)
+                    for i in range(matrix.shape[1])
+                ])
+
+        return prices, reconstructed
+
+    _forecast.__name__ = f"{getattr(model_fn, '__name__', 'model')}@{space}"
+    return _forecast
 
 
 # --------------------------------------------------------------------------
@@ -248,6 +287,7 @@ def summarize(rows, interval="1d", cost_bps=10.0, n_trials=1):
         summary["mase_step1"] = summary["by_step"][0]["mase"]
         summary["skill_step1"] = summary["by_step"][0]["skill_vs_naive"]
 
+    summary.update(_return_space(frame))
     summary.update(_distributional(frame))
     summary.update(_economic(frame, interval, cost_bps, n_trials))
     return summary
@@ -289,6 +329,39 @@ def _directional(frame):
     if not scored.any():
         return float("nan")
     return float(np.mean(true_dir[scored] == pred_dir[scored]))
+
+
+def _return_space(frame):
+    """Score the same forecasts as cumulative returns from each anchor.
+
+    Price-space MASE is contaminated by drift: its scale comes from an old
+    window while prices move away from it, so a naive forecast can score well
+    above 1.0 with nothing wrong. In return space the naive forecast is exactly
+    zero, so skill_returns is a clean read on whether the model knows anything.
+    """
+    anchors = frame["anchor_value"].to_numpy(float)
+    y_true = frame["y_true"].to_numpy(float)
+    y_pred = frame["y_pred"].to_numpy(float)
+
+    usable = (anchors > 0) & (y_true > 0) & (y_pred > 0)
+    if usable.sum() < 4:
+        return {}
+
+    realised = np.log(y_true[usable] / anchors[usable])
+    predicted = np.log(y_pred[usable] / anchors[usable])
+
+    model_mae = metrics.mae(realised, predicted)
+    # The naive forecast in return space is zero, by definition.
+    naive_mae = metrics.mae(realised, np.zeros_like(realised))
+    if not np.isfinite(naive_mae) or naive_mae <= 0:
+        return {}
+
+    return {
+        "mae_returns": model_mae,
+        "naive_mae_returns": naive_mae,
+        "skill_returns": float(1.0 - model_mae / naive_mae),
+        "ic_returns": metrics.information_coefficient(predicted, realised),
+    }
 
 
 def _distributional(frame):

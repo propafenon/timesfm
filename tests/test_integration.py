@@ -71,6 +71,11 @@ app.bt_horizon_var.set(5)
 app.bt_step_var.set(20)
 app.bt_baselines_var.set(True)
 app.bt_timesfm_var.set(False)
+# Price space first, so baseline names stay unsuffixed for these assertions.
+import transforms as tf
+app.bt_space_var.set(tf.SPACE_LABELS[tf.PRICE])
+assert app._selected_space() in tf.TARGET_SPACES
+assert app._selected_backtest_space() == tf.PRICE
 
 captured = {}
 
@@ -106,7 +111,7 @@ def detail_step():
 
 _root.after(200, save_step)
 _root.mainloop()
-_root.destroy()
+# NB: no destroy() here - the return-space run below reuses this root.
 
 row = captured['grid'][0]
 assert row[11] != "-", "MASE was not written to the history grid"
@@ -116,10 +121,12 @@ results = captured['backtest']
 assert len(results) >= 5, f"expected every baseline to be saved, got {len(results)}"
 by_model = {r[1].split(" ")[0]: r for r in results}
 assert "naive" in by_model, by_model.keys()
+# Columns: 5 Skill%, 6 Skill r%, 7 Dir%
 # A flat forecast has no directional view; it must read as "-", not 0%.
-assert by_model["naive"][6] == "-", by_model["naive"]
-# Naive against itself has exactly zero skill.
+assert by_model["naive"][7] == "-", by_model["naive"]
+# Naive against itself has exactly zero skill in both spaces.
 assert by_model["naive"][5] == "0.0%", by_model["naive"]
+assert by_model["naive"][6] in ("0.0%", "-"), by_model["naive"]
 print(f"{len(results)} backtest runs saved; naive reports no directional view")
 
 points = db.get_backtest_points(int(results[0][0]))
@@ -129,4 +136,42 @@ print(f"backtest_points persisted: {len(points)} rows across all 5 horizon steps
 
 assert "by horizon step" in captured['log'], "per-step detail did not render"
 print("per-step detail rendered without raising on null metrics")
+
+# ---- step 8: the same run, modelled on returns ------------------------
+app.bt_space_var.set(tf.SPACE_LABELS[tf.LOG_RETURN])
+app.bt_timesfm_var.set(False)
+second = {}
+
+
+def run_returns():
+    app.thread_run_backtest()
+    _root.after(9000, collect_returns)
+
+
+def collect_returns():
+    second['rows'] = [app.bt_tree.item(r, "values") for r in app.bt_tree.get_children()]
+    second['log'] = app.log_text.get("1.0", "end")
+    _root.quit()
+
+
+_root.after(200, run_returns)
+_root.mainloop()
+_root.destroy()
+
+names = {r[1].split(" ")[0] for r in second['rows']}
+assert any(n.endswith("@log_return") for n in names), names
+assert "naive@price" in names, names
+print(f"return-space run produced: {sorted(n for n in names if '@' in n)}")
+
+# Reconstructed forecasts must be real positive prices, not returns.
+ret_run = next(r for r in second['rows'] if r[1].startswith("naive@log_return"))
+pts = db.get_backtest_points(int(ret_run[0]))
+preds = [p['y_pred'] for p in pts]
+assert all(p > 1.0 for p in preds), "forecasts were not reconstructed to price space"
+assert 10 < float(np.median(preds)) < 10000, np.median(preds)
+print(f"reconstructed to price space: median y_pred={np.median(preds):.2f}")
+assert "reconstructed to prices before scoring" in second['log']
+assert "return-space skill" in second['log'].lower()
+print("return-space verdict reported in the log")
+
 print("\nALL INTEGRATION TESTS PASSED")

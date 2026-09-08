@@ -9,6 +9,7 @@ import db_manager
 import data_cache
 import backtest
 import metrics
+import transforms
 import csv
 import sys
 
@@ -60,6 +61,7 @@ class TimesFMApp:
         self.forecast_anchor = None
         self.forecast_target_col = None
         self.forecast_quantiles = None
+        self.forecast_space = transforms.PRICE
         self.data_meta = {}
         self.backtest_thread = None
         self.backtest_stop = threading.Event()
@@ -211,6 +213,12 @@ class TimesFMApp:
         ttk.Combobox(controls, textvariable=self.bt_mode_var, values=["sliding", "expanding"],
                      width=10, state="readonly").grid(row=0, column=9, sticky="w")
 
+        ttk.Label(controls, text="Model in:").grid(row=0, column=10, sticky="w", padx=(8, 2))
+        self.bt_space_var = tk.StringVar(value=transforms.SPACE_LABELS[transforms.LOG_RETURN])
+        ttk.Combobox(controls, textvariable=self.bt_space_var,
+                     values=[transforms.SPACE_LABELS[space] for space in transforms.TARGET_SPACES],
+                     width=14, state="readonly").grid(row=0, column=11, sticky="w")
+
         self.bt_baselines_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(controls, text="Include baselines", variable=self.bt_baselines_var
                         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -233,8 +241,9 @@ class TimesFMApp:
         self.bt_progress = ttk.Label(parent, text="Idle.")
         self.bt_progress.pack(fill="x", padx=10)
 
-        columns = ("ID", "Model", "Origins", "MASE h1", "MASE all", "Skill%", "Dir%",
-                   "DM p", "CRPS", "Cov80", "IC", "Sharpe", "MaxDD", "DSR")
+        columns = ("ID", "Model", "Origins", "MASE h1", "MASE all", "Skill%",
+                   "Skill r%", "Dir%", "DM p", "CRPS", "Cov80", "IC", "Sharpe",
+                   "MaxDD", "DSR")
         results = ttk.LabelFrame(parent, text="Results  (MASE < 1 beats naive; DSR is the "
                                               "probability the Sharpe survives how many configs you tried)",
                                  padding=(10, 5))
@@ -285,6 +294,13 @@ class TimesFMApp:
         self.backtest_thread = threading.Thread(target=self._run_backtest_job, daemon=True)
         self.backtest_thread.start()
 
+    def _selected_backtest_space(self):
+        label = self.bt_space_var.get()
+        for space, text in transforms.SPACE_LABELS.items():
+            if text == label:
+                return space
+        return transforms.PRICE
+
     def _timesfm_model_fn(self, horizon):
         """Wrap the already-loaded model in the backtest's model_fn contract."""
         def _forecast(context, steps):
@@ -329,6 +345,8 @@ class TimesFMApp:
                     f"plus a {horizon}-step horizon. Fetch a longer period or shrink the context."
                 )
 
+            space = self._selected_backtest_space()
+
             models = {}
             if self.bt_baselines_var.get():
                 models.update(backtest.BASELINES)
@@ -341,6 +359,18 @@ class TimesFMApp:
                 models["timesfm"] = self._timesfm_model_fn(horizon)
             if not models:
                 raise ValueError("Select at least one model to backtest.")
+
+            if space != transforms.PRICE:
+                # Wrapping changes what a baseline means: `naive` on returns
+                # predicts the last return again, which is momentum. Name them
+                # accordingly so the results table does not mislead.
+                models = {f"{name}@{space}": backtest.in_return_space(fn, space)
+                          for name, fn in models.items()}
+                # Keep an unwrapped price-space naive as the anchor of the table.
+                models["naive@price"] = backtest.naive
+                self.root.after(0, self.log_message,
+                                f"Modelling {transforms.SPACE_LABELS[space].lower()}; "
+                                "forecasts are reconstructed to prices before scoring.")
 
             self.root.after(0, self.log_message,
                             f"Walk-forward: {len(origins)} origins x {len(models)} model(s), "
@@ -410,13 +440,27 @@ class TimesFMApp:
                         key=lambda kv: (kv[1].get("mase_step1") or float('inf')))
         best, best_summary = ranked[0]
         self.log_message(
-            f"Best one-step MASE: {best} at {best_summary.get('mase_step1', float('nan')):.3f}."
+            f"Best one-step MASE: {best} at "
+            f"{self._fmt(best_summary.get('mase_step1'))}."
         )
-        if (best_summary.get("mase_step1") or 9e9) >= 1.0:
+
+        # Return-space skill is the cleaner verdict: it is not distorted by
+        # drift, and its naive reference is exactly zero.
+        by_return_skill = [(name, summary.get("skill_returns"))
+                           for name, summary in table.items()
+                           if summary.get("skill_returns") is not None
+                           and summary.get("skill_returns") == summary.get("skill_returns")]
+        if by_return_skill:
+            name, skill = max(by_return_skill, key=lambda kv: kv[1])
             self.log_message(
-                "No model beat the naive forecast at h=1. That is the expected "
-                "result on price levels, and it is the honest answer.", "warning"
+                f"Best return-space skill: {name} at {skill * 100:+.2f}% versus "
+                "predicting a zero return."
             )
+            if skill <= 0:
+                self.log_message(
+                    "Nothing beat a zero-return forecast. On price series that is "
+                    "the expected result, and it is the honest answer.", "warning"
+                )
 
     def refresh_backtest_history(self):
         threading.Thread(target=self._load_backtest_history_job, daemon=True).start()
@@ -450,6 +494,8 @@ class TimesFMApp:
                 self._fmt(summary.get("mase_step1")),
                 self._fmt(summary.get("mase")),
                 self._fmt(summary.get("skill_vs_naive"), ".1f", 100.0, "%"),
+                # Return-space skill: drift-free, and the honest read.
+                self._fmt(summary.get("skill_returns"), ".1f", 100.0, "%"),
                 self._fmt(summary.get("directional_accuracy"), ".0f", 100.0, "%"),
                 self._fmt(summary.get("dm_pvalue_vs_naive")),
                 self._fmt(summary.get("crps"), ".4f"),
@@ -565,6 +611,14 @@ class TimesFMApp:
         ttk.Label(model_frame, text="Freq Indicator (0=High, 1=Min...):").grid(row=5, column=0, sticky="w", pady=2)
         self.freq_ind_var = tk.IntVar(value=0)
         ttk.Entry(model_frame, textvariable=self.freq_ind_var, width=10).grid(row=5, column=1, sticky="e", pady=2)
+
+        # Modelling levels makes the model track the trend and contaminates
+        # MASE with drift. Returns are stationary and are what a trade depends on.
+        ttk.Label(model_frame, text="Model in:").grid(row=6, column=0, sticky="w", pady=2)
+        self.target_space_var = tk.StringVar(value=transforms.SPACE_LABELS[transforms.LOG_RETURN])
+        ttk.Combobox(model_frame, textvariable=self.target_space_var,
+                     values=[transforms.SPACE_LABELS[space] for space in transforms.TARGET_SPACES],
+                     width=14, state="readonly").grid(row=6, column=1, sticky="e", pady=2)
 
     def build_action_buttons(self):
 
@@ -720,9 +774,19 @@ class TimesFMApp:
                                 f"Filled {gaps} missing value(s) in '{target_col}' by carrying prices forward.",
                                 "warning")
             
+            # Move to the modelling space before anything is sliced or padded,
+            # so the context length is counted in the units the model sees.
+            space = self._selected_space()
+            price_series = time_series
+            if space != transforms.PRICE:
+                time_series = transforms.encode(price_series, space)
+                self.root.after(0, self.log_message,
+                                f"Modelling {transforms.SPACE_LABELS[space].lower()} "
+                                f"({time_series.size} observations after differencing).")
+
             context_len = self.context_len_var.get()
             horizon = self.horizon_var.get()
-            
+
             if context_len <= 0:
                 raise ValueError("Context length must be strictly greater than 0.")
                 
@@ -818,10 +882,30 @@ class TimesFMApp:
                 if quantile_forecast is not None:
                     raw_quantiles = np.asarray(quantile_forecast)[0]
 
-            self.forecast_quantiles = self._normalise_quantiles(raw_quantiles, horizon)
-            if self.forecast_quantiles:
+            spread = self._normalise_quantiles(raw_quantiles, horizon)
+            if spread:
                 self.root.after(0, self.log_message,
-                                f"Captured {len(self.forecast_quantiles['levels'])} quantile levels.")
+                                f"Captured {len(spread['levels'])} quantile levels.")
+
+            # Reconstruct a price path so the plot, the CSV and every saved
+            # score stay in price space no matter what was modelled.
+            if space != transforms.PRICE:
+                anchor_price = float(price_series[-1])
+                forecast_result = transforms.decode(
+                    np.asarray(forecast_result, dtype=float).reshape(-1), anchor_price, space)
+                if spread:
+                    matrix = np.asarray(spread["values"], dtype=float)
+                    spread = {
+                        "levels": spread["levels"],
+                        # Each quantile path compounds on its own.
+                        "values": np.column_stack([
+                            transforms.decode(matrix[:, i], anchor_price, space)
+                            for i in range(matrix.shape[1])
+                        ]).tolist(),
+                    }
+
+            self.forecast_quantiles = spread
+            self.forecast_space = space
             self.forecast_data = forecast_result
             self.forecast_anchor = self.historical_data.index[-1]
             self.forecast_target_col = target_col
@@ -861,6 +945,14 @@ class TimesFMApp:
             self.refresh_forecast_history()
         except Exception as db_e:
             self.log_message(f"Database save failed: {str(db_e)}", "error")
+
+    def _selected_space(self):
+        """Map the combobox label back to a transforms constant."""
+        label = self.target_space_var.get()
+        for space, text in transforms.SPACE_LABELS.items():
+            if text == label:
+                return space
+        return transforms.PRICE
 
     @staticmethod
     def _normalise_quantiles(raw, horizon):
