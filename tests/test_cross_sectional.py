@@ -136,8 +136,13 @@ report = universe.coverage_report(delisted)
 assert delisted.columns[0] in report["stale_names"], report["stale_names"]
 print(f"survivorship: flags {len(report['stale_names'])} stale name(s); "
       f"{report['names_at_start']} at start vs {report['names_at_end']} at end")
-assert "optimistic" in universe.survivorship_note(report)
-print("  and states the warning in plain words")
+note = universe.survivorship_note(report)
+# The wording deliberately no longer claims the bias is always optimistic:
+# excluding casualties understates a long/short momentum book, which shorts
+# exactly the names that get delisted.
+assert "CURRENT membership" in note and "not established" in note, note
+assert "optimistic" not in note, "the note must not claim a fixed direction"
+print("  and states the warning without asserting a direction it cannot know")
 
 
 # ==========================================================================

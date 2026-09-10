@@ -8,10 +8,28 @@ instead of thousands.
 
 SURVIVORSHIP WARNING, because it is the most common way a backtest lies: the
 lists below are today's members. Backtesting them over ten years silently
-excludes every name that was delisted, merged or demoted in between - exactly
-the losers - and inflates every result. `coverage_report` surfaces what is
-missing so the distortion is at least visible. Point-in-time constituent data is
-the only real fix and it is not free.
+excludes every name that was delisted, merged or demoted in between, and it
+includes names that only became liquid BECAUSE they did well - foreknowledge you
+did not have at the start.
+
+The direction of the distortion is not always the flattering one, which is worth
+knowing before you assume your number is too high. Measured on a synthetic
+panel, injecting casualties at 10%/yr:
+
+    long-only momentum        Sharpe 1.10 -> 0.58   (exclusion flattered)
+    long-only reversal        Sharpe 1.77 -> -0.23  (exclusion flattered badly)
+    long/short reversal       Sharpe 0.14 -> -1.04  (exclusion flattered)
+    long/short momentum       Sharpe -0.20 -> 0.56  (exclusion UNDERSTATED)
+
+A long/short momentum book shorts declining names, and delisting candidates
+decline - so leaving them out removes profitable shorts. What matters is not the
+sign but the SIZE: if a plausible correction moves the answer that much, the
+result is not established either way.
+
+`coverage_report` shows what is missing, `full_history_subset` and
+`inject_delistings` bound the effect, and db_manager.record_universe starts
+accumulating the point-in-time membership that would prevent it. Real
+constituent history is the only actual fix and it is not free.
 """
 
 import numpy as np
@@ -143,11 +161,80 @@ def coverage_report(prices):
     }
 
 
+def full_history_subset(prices, tolerance_days=30):
+    """Only the names quoted from (near) the start of the panel.
+
+    This isolates the second half of survivorship bias: names that joined the
+    liquid universe later are in today's list precisely BECAUSE they did well,
+    and their growth sits inside the backtest even though nothing at the start
+    could have told you to pick them. Comparing the two runs measures how much
+    of a result comes from that foreknowledge.
+    """
+    start = prices.index[0]
+    keep = [
+        ticker for ticker in prices.columns
+        if prices[ticker].first_valid_index() is not None
+        and (prices[ticker].first_valid_index() - start).days <= tolerance_days
+    ]
+    return prices[keep]
+
+
+def inject_delistings(prices, annual_rate=0.03, terminal_return=-0.6,
+                      decline_days=120, seed=0):
+    """Add synthetic names that trade normally and then die.
+
+    The first half of survivorship bias cannot be measured from data that
+    excludes the casualties, so it is bounded by simulation instead: create the
+    names the list is missing, at a plausible delisting rate, and see how much
+    the result moves. Each ghost copies a real name's returns until its
+    delisting date, declines by `terminal_return` over its final months, then
+    goes NaN, which is what a real delisting looks like to the portfolio layer.
+
+    This is a SENSITIVITY BOUND, not a correction. Real point-in-time
+    membership data is the only actual fix.
+    """
+    rng = np.random.default_rng(seed)
+    years = max(len(prices) / 252.0, 1.0)
+    n_ghosts = max(int(round(prices.shape[1] * annual_rate * years)), 1)
+
+    stressed = prices.copy()
+    donors = list(prices.columns)
+    for i in range(n_ghosts):
+        donor = donors[rng.integers(len(donors))]
+        source = prices[donor]
+        valid = source.dropna()
+        if len(valid) < decline_days * 2:
+            continue
+
+        # Die somewhere in the second half of the name's life.
+        death_position = int(rng.integers(len(valid) // 2, len(valid)))
+        death_date = valid.index[death_position]
+
+        ghost = source.copy()
+        ghost.loc[ghost.index > death_date] = np.nan
+
+        decline_start = max(death_position - decline_days, 0)
+        window = valid.index[decline_start:death_position + 1]
+        if len(window) > 1:
+            # A geometric slide to the terminal return, so the factor sees a
+            # deteriorating name rather than a cliff out of nowhere.
+            path = np.linspace(0.0, 1.0, len(window))
+            multiplier = (1.0 + terminal_return) ** path
+            ghost.loc[window] = ghost.loc[window].to_numpy(float) * multiplier
+
+        stressed[f"GHOST{i:02d}.IS"] = ghost
+
+    return stressed, n_ghosts
+
+
 def survivorship_note(report):
     """One line the user should read before believing any backtest number."""
     return (
         f"{report['n_tickers']} names, {report['names_at_start']} present at "
         f"{report['start']} and {report['names_at_end']} at {report['end']}. "
-        "This list is CURRENT membership, so names delisted along the way are "
-        "absent and results are optimistic by an unknown amount."
+        "This list is CURRENT membership: names delisted along the way are "
+        "absent, and names that only became liquid because they did well are "
+        "present. Run the survivorship stress test to see how far that moves "
+        "your result - the direction depends on the strategy, but a large "
+        "movement means the result is not established."
     )

@@ -514,6 +514,14 @@ class TimesFMApp:
                                      command=self.thread_run_cross_sectional)
         self.xs_run_btn.grid(row=1, column=6, columnspan=2, sticky="e", pady=(6, 0))
 
+        self.xs_surv_btn = ttk.Button(controls, text="Survivorship Stress Test",
+                                      command=self.thread_survivorship_test)
+        self.xs_surv_btn.grid(row=2, column=6, columnspan=2, sticky="e", pady=(6, 0))
+        ttk.Label(controls, text="Delisting rate/yr:").grid(row=2, column=4, sticky="e", pady=(6, 0))
+        self.xs_delist_var = tk.DoubleVar(value=0.03)
+        ttk.Entry(controls, textvariable=self.xs_delist_var, width=6).grid(
+            row=2, column=5, sticky="w", pady=(6, 0))
+
         results = ttk.LabelFrame(parent, text="Results", padding=(10, 5))
         results.pack(fill="both", expand=True, padx=10, pady=(5, 10))
 
@@ -556,6 +564,14 @@ class TimesFMApp:
             prices = frames["Close"]
             self.universe_prices = prices
             self.universe_panels = frames
+            try:
+                # Dated, once a day. Cannot repair history, but from today
+                # forward this accumulates real point-in-time membership.
+                db_manager.record_universe(list(prices.columns), label="bist")
+            except Exception as snapshot_error:
+                self.root.after(0, self.log_message,
+                                f"Could not record the universe snapshot: {snapshot_error}",
+                                "warning")
 
             # USDTRY is fetched once here so the USD ranking does not have to
             # hit the network mid-backtest.
@@ -594,10 +610,132 @@ class TimesFMApp:
                 + "; ".join(f"{t} ({m})" for t, m in list(failures.items())[:8]), "warning")
         # Say this every time. It is the most common way a backtest lies.
         self.log_message(universe.survivorship_note(report), "warning")
+        try:
+            snapshots = db_manager.get_universe_snapshots()
+            if len(snapshots) > 1:
+                self.log_message(
+                    f"{len(snapshots)} universe snapshots recorded since "
+                    f"{snapshots[0]['snapshot_date']} - point-in-time backtests "
+                    "become possible once this history is long enough.")
+            else:
+                self.log_message(
+                    "Universe snapshot recorded. Keep fetching periodically: after "
+                    "a year or two this becomes point-in-time membership data, "
+                    "which is the only real fix for survivorship bias.")
+        except Exception:
+            pass
         if report["stale_names"]:
             self.log_message(
                 f"{len(report['stale_names'])} name(s) stopped trading before the "
                 f"panel ends: {', '.join(report['stale_names'][:8])}", "warning")
+
+    def thread_survivorship_test(self):
+        if getattr(self, "universe_prices", None) is None:
+            messagebox.showwarning("Survivorship", "Fetch the universe first.")
+            return
+        self.xs_surv_btn.state(["disabled"])
+        threading.Thread(target=self._survivorship_job, daemon=True).start()
+
+    def _survivorship_job(self):
+        """Bound the bias three ways, since it cannot be removed from this data."""
+        try:
+            prices = self.universe_prices
+            panels = getattr(self, "universe_panels", None)
+            factor_name = self.xs_factor_var.get()
+            frequency = self.xs_freq_var.get()
+            quantile = float(self.xs_quantile_var.get())
+            cost_bps = float(self.xs_cost_var.get())
+            rate = max(float(self.xs_delist_var.get()), 0.0)
+
+            def score(panel, sub_panels=None):
+                factor = cross_sectional.FACTORS[factor_name](panel, sub_panels)
+                outcome = cross_sectional.run(
+                    panel, factor=factor, frequency=frequency,
+                    top_quantile=quantile, bottom_quantile=quantile,
+                    long_only=self.xs_long_only_var.get(), cost_bps=cost_bps,
+                    panels=sub_panels,
+                )
+                ic = cross_sectional.information_coefficient(panel, factor, frequency)
+                return outcome["summary"], ic
+
+            self.root.after(0, self.log_message,
+                            "--- Survivorship stress test: three views of the same strategy ---")
+
+            base, base_ic = score(prices, panels)
+            self.root.after(0, self.log_message,
+                            f"1. As tested ({prices.shape[1]} names): Sharpe "
+                            f"{self._fmt(base.get('sharpe_net'), '.2f')}, "
+                            f"IC t {self._fmt(base_ic.get('ic_t_stat'), '.1f')}")
+
+            # Names present from the start only: removes the foreknowledge of
+            # which small companies would later become liquid.
+            subset = universe.full_history_subset(prices)
+            if subset.shape[1] >= 10:
+                sub_panels = None
+                if panels:
+                    sub_panels = {k: v[subset.columns] for k, v in panels.items()}
+                early, early_ic = score(subset, sub_panels)
+                self.root.after(0, self.log_message,
+                                f"2. Full-history names only ({subset.shape[1]}): Sharpe "
+                                f"{self._fmt(early.get('sharpe_net'), '.2f')}, "
+                                f"IC t {self._fmt(early_ic.get('ic_t_stat'), '.1f')} "
+                                "- drops the late joiners you could not have known to pick")
+            else:
+                early = None
+                self.root.after(0, self.log_message,
+                                f"2. Only {subset.shape[1]} names span the whole panel; "
+                                "too few to test that way.", "warning")
+
+            # Synthetic casualties, to stand in for the names the list omits.
+            stressed, n_ghosts = universe.inject_delistings(
+                prices, annual_rate=rate, seed=0)
+            ghost, ghost_ic = score(stressed, None)
+            self.root.after(0, self.log_message,
+                            f"3. With {n_ghosts} simulated delistings at {rate:.1%}/yr: Sharpe "
+                            f"{self._fmt(ghost.get('sharpe_net'), '.2f')}, "
+                            f"IC t {self._fmt(ghost_ic.get('ic_t_stat'), '.1f')}")
+
+            self.root.after(0, self._survivorship_verdict, base, early, ghost)
+        except Exception as error:
+            self.root.after(0, self.log_message,
+                            f"Survivorship test failed: {error}", "error")
+        finally:
+            self.root.after(0, lambda: self.xs_surv_btn.state(["!disabled"]))
+
+    def _survivorship_verdict(self, base, early, ghost):
+        baseline = base.get("sharpe_net")
+        if baseline is None or baseline != baseline:
+            return
+        worst = baseline
+        for candidate in (early, ghost):
+            if candidate and candidate.get("sharpe_net") == candidate.get("sharpe_net"):
+                worst = min(worst, candidate["sharpe_net"])
+
+        values = [baseline]
+        for candidate in (early, ghost):
+            if candidate and candidate.get("sharpe_net") == candidate.get("sharpe_net"):
+                values.append(candidate["sharpe_net"])
+        low, high = min(values), max(values)
+        spread = high - low
+
+        # The SIZE of the spread is the finding, not its direction. Excluding
+        # casualties flatters a long-only book but can understate a long/short
+        # momentum book, which shorts exactly the names that get delisted.
+        self.log_message(
+            f"Range across the three views: {self._fmt(low, '.2f')} to "
+            f"{self._fmt(high, '.2f')} (spread {self._fmt(spread, '.2f')}).",
+            "warning" if spread > 0.3 else "info")
+
+        if spread > 0.3:
+            self.log_message(
+                "That spread is large: which names are in the universe moves the "
+                "answer more than the strategy does, so this result is not "
+                "established in either direction.", "warning")
+        if low <= 0 < high:
+            self.log_message(
+                "One plausible universe turns this strategy unprofitable. Treat "
+                "the negative end as the live case until you have real "
+                "point-in-time membership.", "warning")
 
     def thread_run_cross_sectional(self):
         if getattr(self, "universe_prices", None) is None:

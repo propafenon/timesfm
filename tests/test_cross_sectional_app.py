@@ -98,7 +98,7 @@ panel = app.universe_prices.copy()
 panel.iloc[800:, 3] = np.nan
 report = universe.coverage_report(panel)
 assert panel.columns[3] in report["stale_names"]
-assert "optimistic" in universe.survivorship_note(report)
+assert "CURRENT membership" in universe.survivorship_note(report)
 print(f"  survivorship: {len(report['stale_names'])} stale name(s) flagged")
 
 _root.destroy()

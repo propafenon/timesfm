@@ -11,7 +11,7 @@ DB_PATH = os.path.join(DB_DIR, 'forecast_history.db')
 
 # Bumped whenever the schema or the blob encoding changes. Tracked in SQLite's
 # own PRAGMA user_version so migrations run once, not on every startup.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Everything the history grid displays. The forecast blob is deliberately absent
 # so listing runs does not decode every forecast ever saved.
@@ -26,6 +26,18 @@ BACKTEST_RUN_COLUMNS = (
     'context_length', 'horizon_length', 'step', 'mode', 'adjusted', 'cost_bps',
     'n_origins', 'n_points', 'summary',
 )
+
+# Recording today's universe, dated. It cannot repair history, but from now on
+# it accumulates the point-in-time membership that would have prevented the
+# problem in the first place - and it is the only fix that costs nothing.
+_CREATE_UNIVERSE_SNAPSHOTS = '''
+    CREATE TABLE IF NOT EXISTS universe_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_date TEXT NOT NULL,
+        label TEXT,
+        tickers TEXT NOT NULL
+    )
+'''
 
 _CREATE_BACKTEST_RUNS = '''
     CREATE TABLE IF NOT EXISTS backtest_runs (
@@ -218,6 +230,7 @@ def init_db():
 
         conn.execute(_CREATE_BACKTEST_RUNS)
         conn.execute(_CREATE_BACKTEST_POINTS)
+        conn.execute(_CREATE_UNIVERSE_SNAPSHOTS)
         conn.execute('''
             CREATE INDEX IF NOT EXISTS idx_forecast_runs_ticker_ts
             ON forecast_runs (ticker, timestamp)
@@ -397,6 +410,57 @@ def insert_backtest_points(run_id, rows):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', payload)
     return len(payload)
+
+
+def record_universe(tickers, label="", snapshot_date=None):
+    """Store today's universe so future backtests can be point-in-time.
+
+    Recorded at most once per day per label: re-running the fetch should not
+    multiply the history.
+    """
+    import datetime as _dt
+    snapshot_date = snapshot_date or _dt.date.today().isoformat()
+    payload = json.dumps(sorted(set(tickers)))
+    with _connect() as conn:
+        existing = conn.execute(
+            'SELECT id FROM universe_snapshots WHERE snapshot_date = ? AND label = ?',
+            (snapshot_date, label)
+        ).fetchone()
+        if existing:
+            conn.execute('UPDATE universe_snapshots SET tickers = ? WHERE id = ?',
+                         (payload, existing[0]))
+            return int(existing[0])
+        cursor = conn.execute(
+            'INSERT INTO universe_snapshots (snapshot_date, label, tickers) VALUES (?, ?, ?)',
+            (snapshot_date, label, payload)
+        )
+        return cursor.lastrowid
+
+
+def get_universe_snapshots():
+    """Every recorded universe, oldest first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            'SELECT id, snapshot_date, label, tickers FROM universe_snapshots '
+            'ORDER BY snapshot_date'
+        ).fetchall()
+    return [{'id': r[0], 'snapshot_date': r[1], 'label': r[2],
+             'tickers': _load_list(r[3])} for r in rows]
+
+
+def universe_as_of(target_date, label=""):
+    """The most recent snapshot on or before `target_date`.
+
+    This is the query a point-in-time backtest needs: what the universe looked
+    like THEN, not what it looks like now.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            'SELECT tickers FROM universe_snapshots WHERE snapshot_date <= ? '
+            'AND label = ? ORDER BY snapshot_date DESC LIMIT 1',
+            (str(target_date), label)
+        ).fetchone()
+    return _load_list(row[0]) if row else []
 
 
 def count_backtest_runs(prefix=None):

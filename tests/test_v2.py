@@ -19,7 +19,7 @@ c.execute('INSERT INTO forecast_runs (ticker,interval,context_length,horizon_len
           ('OLD.IS','1d',1056,3,'repo','max',pickle.dumps([1.,2.,3.]),0.5))
 c.commit(); c.close()
 db.init_db(); db.init_db()
-assert uv()==3, uv()
+assert uv()==4, uv()
 r=db.get_forecast_by_id(1)
 assert r['forecast_data']==[1.,2.,3.] and r['mae_score']==0.5 and r['quantiles'] is None
 assert r['mase_score'] is None
