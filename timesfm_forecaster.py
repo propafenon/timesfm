@@ -13,6 +13,8 @@ import transforms
 import features
 import sk_models
 import vol_models
+import universe
+import cross_sectional
 import csv
 import os  # Added for scanning local model directories
 import sys
@@ -101,6 +103,7 @@ class TimesFMApp:
         self.data_meta = {}
         self.backtest_thread = None
         self.backtest_stop = threading.Event()
+        self.universe_prices = None
         self.model_lock = threading.Lock()
         # These collections describe the fetched feature table and its UI selections.
         self.feature_catalog = []
@@ -147,10 +150,12 @@ class TimesFMApp:
         tab_settings = ttk.Frame(parent_notebook)
 
         tab_backtest = ttk.Frame(parent_notebook)
+        tab_cross = ttk.Frame(parent_notebook)
 
         parent_notebook.add(tab_inference, text="Inference & Visualization")
         parent_notebook.add(tab_logs, text="System Logs")
         parent_notebook.add(tab_backtest, text="Backtest & Validation")
+        parent_notebook.add(tab_cross, text="Cross-Sectional")
         parent_notebook.add(tab_settings, text="Model Settings")
 
         # INFERENCE & VISUALIZATION TAB
@@ -346,6 +351,7 @@ class TimesFMApp:
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         self.build_backtest_tab(tab_backtest)
+        self.build_cross_sectional_tab(tab_cross)
         self.init_plot()
 
         # sashpos only works once the widget has been mapped and sized.
@@ -439,6 +445,251 @@ class TimesFMApp:
         scroll = ttk.Scrollbar(results, orient="vertical", command=self.bt_tree.yview)
         scroll.pack(side="right", fill="y")
         self.bt_tree.configure(yscrollcommand=scroll.set)
+
+    # ----------------------------------------------------------------
+    # Cross-sectional tab
+    # ----------------------------------------------------------------
+
+    def build_cross_sectional_tab(self, parent):
+        top = ttk.LabelFrame(parent, text="Universe", padding=(10, 5))
+        top.pack(fill="x", padx=10, pady=(10, 5))
+
+        ttk.Label(top, text="Tickers (comma-separated):").grid(row=0, column=0, sticky="w")
+        self.xs_tickers_var = tk.StringVar(value=", ".join(universe.BIST_LIQUID))
+        ttk.Entry(top, textvariable=self.xs_tickers_var, width=90).grid(
+            row=0, column=1, columnspan=6, sticky="we", padx=4)
+        ttk.Button(top, text="Reset to BIST list", command=lambda: self.xs_tickers_var.set(
+            ", ".join(universe.BIST_LIQUID))).grid(row=0, column=7, padx=4)
+
+        self.xs_fetch_btn = ttk.Button(top, text="Fetch Universe",
+                                       command=self.thread_fetch_universe)
+        self.xs_fetch_btn.grid(row=1, column=0, pady=(6, 0), sticky="w")
+        self.xs_status = ttk.Label(top, text="No universe loaded.")
+        self.xs_status.grid(row=1, column=1, columnspan=7, sticky="w", pady=(6, 0))
+
+        controls = ttk.LabelFrame(parent, text="Strategy", padding=(10, 5))
+        controls.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(controls, text="Factor:").grid(row=0, column=0, sticky="w")
+        self.xs_factor_var = tk.StringVar(value="momentum_12_1")
+        ttk.Combobox(controls, textvariable=self.xs_factor_var,
+                     values=list(cross_sectional.FACTORS), width=20,
+                     state="readonly").grid(row=0, column=1, sticky="w", padx=(2, 10))
+
+        ttk.Label(controls, text="Rebalance:").grid(row=0, column=2, sticky="w")
+        self.xs_freq_var = tk.StringVar(value="M")
+        ttk.Combobox(controls, textvariable=self.xs_freq_var, values=["W", "M", "Q"],
+                     width=4, state="readonly").grid(row=0, column=3, sticky="w", padx=(2, 10))
+
+        ttk.Label(controls, text="Top/bottom %:").grid(row=0, column=4, sticky="w")
+        self.xs_quantile_var = tk.DoubleVar(value=0.2)
+        ttk.Entry(controls, textvariable=self.xs_quantile_var, width=6).grid(
+            row=0, column=5, sticky="w", padx=(2, 10))
+
+        ttk.Label(controls, text="Cost (bps):").grid(row=0, column=6, sticky="w")
+        self.xs_cost_var = tk.DoubleVar(value=20.0)
+        ttk.Entry(controls, textvariable=self.xs_cost_var, width=6).grid(
+            row=0, column=7, sticky="w", padx=(2, 10))
+
+        self.xs_long_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls, text="Long only", variable=self.xs_long_only_var
+                        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self.xs_vol_target_on = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Volatility target (HAR-RV)",
+                        variable=self.xs_vol_target_on
+                        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        self.xs_vol_target_var = tk.DoubleVar(value=0.15)
+        ttk.Entry(controls, textvariable=self.xs_vol_target_var, width=6).grid(
+            row=1, column=4, sticky="w", pady=(6, 0))
+        ttk.Label(controls, text="annualised").grid(row=1, column=5, sticky="w", pady=(6, 0))
+
+        self.xs_run_btn = ttk.Button(controls, text="Run Cross-Sectional Backtest",
+                                     command=self.thread_run_cross_sectional)
+        self.xs_run_btn.grid(row=1, column=6, columnspan=2, sticky="e", pady=(6, 0))
+
+        results = ttk.LabelFrame(parent, text="Results", padding=(10, 5))
+        results.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+
+        columns = ("Factor", "Freq", "Years", "CAGR", "Sharpe net", "Sharpe gross",
+                   "MaxDD", "Hit", "Turnover/yr", "Cost drag", "Lev", "IC", "IC t")
+        self.xs_tree = ttk.Treeview(results, columns=columns, show="headings", height=8)
+        for column in columns:
+            self.xs_tree.heading(column, text=column)
+            self.xs_tree.column(column, width=84, anchor="center")
+        self.xs_tree.column("Factor", width=140, anchor="w")
+        self.xs_tree.pack(fill="both", expand=True, side="left")
+        xs_scroll = ttk.Scrollbar(results, orient="vertical", command=self.xs_tree.yview)
+        xs_scroll.pack(side="right", fill="y")
+        self.xs_tree.configure(yscrollcommand=xs_scroll.set)
+
+    def thread_fetch_universe(self):
+        tickers = [t.strip().upper() for t in self.xs_tickers_var.get().split(",") if t.strip()]
+        if len(tickers) < 10:
+            messagebox.showwarning(
+                "Universe",
+                f"Only {len(tickers)} ticker(s). Ranking needs breadth to mean "
+                "anything - use at least 10, ideally 30 or more."
+            )
+            return
+        self.xs_fetch_btn.state(["disabled"])
+        threading.Thread(target=self._fetch_universe_job, args=(tickers,), daemon=True).start()
+
+    def _fetch_universe_job(self, tickers):
+        try:
+            def progress(done, total, ticker):
+                self.root.after(0, lambda: self.xs_status.config(
+                    text=f"Fetching {done}/{total}: {ticker}"))
+
+            prices, failures = universe.fetch_panel(
+                tickers, period=self.period_var.get(), interval=self.interval_var.get(),
+                # Raw prices: adjusted closes embed later corporate actions.
+                adjusted=False, progress_cb=progress,
+            )
+            self.universe_prices = prices
+            report = universe.coverage_report(prices)
+            self.root.after(0, self._on_universe_fetched, report, failures)
+        except Exception as error:
+            self.root.after(0, self._on_universe_error, str(error))
+
+    def _on_universe_error(self, message):
+        self.xs_fetch_btn.state(["!disabled"])
+        self.xs_status.config(text="Fetch failed.")
+        self.log_message(f"Universe fetch failed: {message}", "error")
+        messagebox.showerror("Universe", message)
+
+    def _on_universe_fetched(self, report, failures):
+        self.xs_fetch_btn.state(["!disabled"])
+        self.xs_status.config(
+            text=f"{report['n_tickers']} names, {report['n_dates']} dates, "
+                 f"{report['start']} to {report['end']}")
+        self.log_message(
+            f"Universe: {report['n_tickers']} names over {report['n_dates']} dates "
+            f"({report['start']} to {report['end']}), median history "
+            f"{report['median_history']} bars.")
+        if failures:
+            self.log_message(
+                f"{len(failures)} ticker(s) unavailable: "
+                + "; ".join(f"{t} ({m})" for t, m in list(failures.items())[:8]), "warning")
+        # Say this every time. It is the most common way a backtest lies.
+        self.log_message(universe.survivorship_note(report), "warning")
+        if report["stale_names"]:
+            self.log_message(
+                f"{len(report['stale_names'])} name(s) stopped trading before the "
+                f"panel ends: {', '.join(report['stale_names'][:8])}", "warning")
+
+    def thread_run_cross_sectional(self):
+        if getattr(self, "universe_prices", None) is None:
+            messagebox.showwarning("Cross-Sectional", "Fetch the universe first.")
+            return
+        self.xs_run_btn.state(["disabled"])
+        threading.Thread(target=self._run_cross_sectional_job, daemon=True).start()
+
+    def _run_cross_sectional_job(self):
+        try:
+            prices = self.universe_prices
+            factor_name = self.xs_factor_var.get()
+            frequency = self.xs_freq_var.get()
+            quantile = float(self.xs_quantile_var.get())
+            vol_target = float(self.xs_vol_target_var.get()) if self.xs_vol_target_on.get() else None
+
+            self.root.after(0, self.log_message,
+                            f"Cross-sectional: {factor_name}, {frequency} rebalance, "
+                            f"top/bottom {quantile:.0%}, "
+                            f"{'long only' if self.xs_long_only_var.get() else 'long/short'}"
+                            + (f", vol target {vol_target:.0%}" if vol_target else ""))
+
+            factor = cross_sectional.FACTORS[factor_name](prices)
+            result = cross_sectional.run(
+                prices, factor=factor, frequency=frequency,
+                top_quantile=quantile, bottom_quantile=quantile,
+                long_only=self.xs_long_only_var.get(),
+                cost_bps=float(self.xs_cost_var.get()),
+                vol_target=vol_target,
+            )
+            ic = cross_sectional.information_coefficient(prices, factor, frequency)
+            self.root.after(0, self._on_cross_sectional_done, factor_name, frequency,
+                            result, ic)
+        except Exception as error:
+            self.root.after(0, self._on_cross_sectional_error,
+                            f"{str(error)}\n{traceback.format_exc()}")
+
+    def _on_cross_sectional_error(self, message):
+        self.xs_run_btn.state(["!disabled"])
+        self.log_message(str(message), "error")
+        messagebox.showerror("Cross-Sectional", str(message).strip().splitlines()[0])
+
+    def _on_cross_sectional_done(self, factor_name, frequency, result, ic):
+        self.xs_run_btn.state(["!disabled"])
+        summary = result["summary"]
+        self.xs_tree.insert("", 0, values=(
+            factor_name, frequency,
+            self._fmt(summary.get("years"), ".1f"),
+            self._fmt(summary.get("cagr_net"), ".1f", 100.0, "%"),
+            self._fmt(summary.get("sharpe_net"), ".2f"),
+            self._fmt(summary.get("sharpe_gross"), ".2f"),
+            self._fmt(summary.get("max_drawdown"), ".1f", 100.0, "%"),
+            self._fmt(summary.get("hit_rate"), ".0f", 100.0, "%"),
+            self._fmt(summary.get("turnover_annual"), ".1f") + "x",
+            self._fmt(summary.get("cost_drag_annual"), ".2f", 100.0, "%"),
+            self._fmt(summary.get("avg_leverage"), ".2f"),
+            self._fmt(ic.get("ic_mean"), ".3f"),
+            self._fmt(ic.get("ic_t_stat"), ".1f"),
+        ))
+
+        self.log_message(
+            f"{factor_name}: net Sharpe {self._fmt(summary.get('sharpe_net'), '.2f')} "
+            f"(gross {self._fmt(summary.get('sharpe_gross'), '.2f')}), "
+            f"CAGR {self._fmt(summary.get('cagr_net'), '.1f', 100.0, '%')}, "
+            f"max drawdown {self._fmt(summary.get('max_drawdown'), '.1f', 100.0, '%')}, "
+            f"IC {self._fmt(ic.get('ic_mean'), '.3f')} (t={self._fmt(ic.get('ic_t_stat'), '.1f')})"
+        )
+
+        # An IC t-stat below ~2 means the factor has not demonstrated it knows
+        # anything, whatever the Sharpe looks like.
+        t_stat = ic.get("ic_t_stat")
+        if t_stat is not None and t_stat == t_stat and abs(t_stat) < 2:
+            self.log_message(
+                f"IC t-stat {t_stat:.1f} is below 2: this factor has not shown it "
+                "ranks better than chance, so treat the Sharpe as unproven.", "warning")
+
+        # Always state the cost drag. The share-of-Sharpe version is only
+        # meaningful when the gross Sharpe is positive, and reporting nothing
+        # in the other case is how a strategy's costs go unnoticed.
+        drag = summary.get("cost_drag_annual")
+        gross_sharpe = summary.get("sharpe_gross")
+        net_sharpe = summary.get("sharpe_net")
+        if drag is not None and drag == drag:
+            message = (f"Costs remove {drag*100:.2f}% a year on "
+                       f"{summary.get('turnover_annual', 0):.1f}x turnover")
+            heavy = drag > 0.02
+            if all(v is not None and v == v for v in (gross_sharpe, net_sharpe)) and gross_sharpe > 0:
+                lost = 1.0 - net_sharpe / gross_sharpe
+                message += f", which is {lost*100:.0f}% of the gross Sharpe"
+                heavy = heavy or lost > 0.5
+            self.log_message(message + ".", "warning" if heavy else "info")
+
+        self.plot_cross_sectional(result, factor_name)
+
+    def plot_cross_sectional(self, result, factor_name):
+        """Equity curves on the main chart, net against gross."""
+        if not hasattr(self, "ax"):
+            return
+        self.ax.clear()
+        net = (1.0 + result["net_returns"]).cumprod()
+        gross = (1.0 + result["gross_returns"]).cumprod()
+        self.ax.plot(gross.index, gross.to_numpy(float), label="Gross", color="gray",
+                     linewidth=1.2, linestyle="--")
+        self.ax.plot(net.index, net.to_numpy(float), label="Net of costs", color="blue",
+                     linewidth=1.8)
+        self.ax.axhline(1.0, color="black", linewidth=0.8, alpha=0.4)
+        self.ax.set_title(f"Cross-sectional {factor_name} - growth of 1")
+        self.ax.set_xlabel("Date")
+        self.ax.set_ylabel("Cumulative")
+        self.ax.grid(True, linestyle="--", alpha=0.6)
+        self.ax.legend()
+        self.fig.autofmt_xdate()
+        self.canvas.draw()
 
     def stop_backtest(self):
         self.backtest_stop.set()
