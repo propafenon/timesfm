@@ -399,6 +399,25 @@ def insert_backtest_points(run_id, rows):
     return len(payload)
 
 
+def count_backtest_runs(prefix=None):
+    """How many backtests have been stored, optionally by model-name prefix.
+
+    This is the trial count the deflated Sharpe needs. It must persist across
+    sessions: the whole point is that every configuration you have ever tried
+    makes the best-looking one more likely to be luck, and a counter that resets
+    on restart would quietly flatter every result.
+    """
+    with _connect() as conn:
+        if prefix:
+            row = conn.execute(
+                'SELECT COUNT(*) FROM backtest_runs WHERE model_name LIKE ?',
+                (f'{prefix}%',)
+            ).fetchone()
+        else:
+            row = conn.execute('SELECT COUNT(*) FROM backtest_runs').fetchone()
+        return int(row[0])
+
+
 def get_backtest_runs():
     columns = ', '.join(BACKTEST_RUN_COLUMNS)
     with _connect() as conn:

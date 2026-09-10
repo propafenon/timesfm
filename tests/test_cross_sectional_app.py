@@ -58,11 +58,15 @@ rows = captured['rows']
 assert rows, captured['log'][-900:]
 row = rows[0]
 print(f"  result: factor={row[0]} years={row[2]} CAGR={row[3]} "
-      f"SharpeNet={row[4]} SharpeGross={row[5]} MaxDD={row[6]}")
-print(f"          turnover={row[8]} costdrag={row[9]} lev={row[10]} IC={row[11]} ICt={row[12]}")
-assert row[0] == "momentum_12_1"
+      f"SharpeNet={row[4]} SharpeGross={row[5]} DSR={row[6]} trials={row[7]}")
+print(f"          maxDD={row[8]} turnover={row[10]} costdrag={row[11]} "
+      f"lev={row[12]} IC={row[13]} ICt={row[14]}")
+assert row[0].startswith("momentum_12_1")   # label now carries the currency
+assert "[TRY]" in row[0], row[0]
 assert row[4] not in ("-", ""), "no net Sharpe produced"
-assert row[11] not in ("-", ""), "no IC produced"
+assert row[13] not in ("-", ""), "no IC produced"
+assert row[6] not in ("-", ""), "no deflated Sharpe produced"
+assert int(row[7]) >= 1, "trial count not recorded"
 
 # Costs must be reported, and the log must state how much they took.
 assert "Costs remove" in captured['log'], captured['log'][-600:]
@@ -70,7 +74,7 @@ print("  log states the share of gross Sharpe lost to costs")
 
 # The IC guard must fire on a factor with no edge.
 assert "IC t-stat" in captured['log'] or "has not shown it" in captured['log'] \
-    or abs(float(row[12])) >= 2
+    or abs(float(row[14])) >= 2
 print("  weak-IC warning present (or IC genuinely significant)")
 
 # Equity curve drawn, net and gross.
@@ -79,8 +83,15 @@ assert "Net of costs" in labels and "Gross" in labels, labels
 print(f"  equity curve plotted: {labels}")
 
 # Vol targeting actually levered.
-assert float(row[10]) > 0
-print(f"  volatility targeting applied, average leverage {row[10]}x")
+assert float(row[12]) > 0
+print(f"  volatility targeting applied, average leverage {row[12]}x")
+
+# The deflated Sharpe must be reported, and the trial count must persist in the
+# database so a search cannot be laundered by restarting the app.
+assert "Deflated Sharpe" in captured['log'], captured['log'][-700:]
+stored = db.count_backtest_runs("xs:")
+assert stored >= 1, stored
+print(f"  deflated Sharpe reported; {stored} cross-sectional trial(s) recorded in the DB")
 
 # Survivorship reporting on a panel with a delisting.
 panel = app.universe_prices.copy()

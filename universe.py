@@ -36,15 +36,21 @@ PRESETS = {"BIST liquid (~40)": BIST_LIQUID}
 
 
 def fetch_panel(tickers, period="max", interval="1d", adjusted=False,
-                column="Close", force_refresh=False, progress_cb=None):
-    """Wide price frame: rows are dates, columns are tickers.
+                column="Close", columns=None, force_refresh=False,
+                progress_cb=None):
+    """Wide price frames: rows are dates, columns are tickers.
 
     One cached fetch per ticker, so a failure loses that name and not the run.
-    Returns (prices, failures). Dates are the union across names, so a name that
-    listed late simply has NaN before it existed - which is correct, and the
-    portfolio layer must skip it there rather than fill it.
+    Returns (result, failures), where result is a single frame when one column
+    was asked for and a {column: frame} dict when several were - Open as well as
+    Close is what the overnight/intraday split needs.
+
+    Dates are the union across names, so a name that listed late has NaN before
+    it existed. That is correct, and the portfolio layer must skip it there
+    rather than fill it in.
     """
-    series_by_ticker = {}
+    wanted = list(columns) if columns else [column]
+    collected = {name: {} for name in wanted}
     failures = {}
 
     for position, ticker in enumerate(tickers, start=1):
@@ -55,24 +61,55 @@ def fetch_panel(tickers, period="max", interval="1d", adjusted=False,
                 ticker, period, interval, adjusted=adjusted,
                 force_refresh=force_refresh,
             )
-            if column not in frame.columns:
-                raise ValueError(f"no '{column}' column")
-            values = pd.to_numeric(frame[column], errors="coerce")
-            values = values[values > 0]
-            if values.empty:
+            missing = [c for c in wanted if c not in frame.columns]
+            if missing:
+                raise ValueError(f"no {', '.join(missing)} column")
+
+            close = pd.to_numeric(frame[wanted[0]], errors="coerce")
+            valid = close.index[close > 0]
+            if valid.empty:
                 raise ValueError("no positive prices")
-            series_by_ticker[ticker] = values
+            for name in wanted:
+                values = pd.to_numeric(frame[name], errors="coerce").reindex(valid)
+                collected[name][ticker] = values[values > 0]
         except Exception as error:
             failures[ticker] = str(error)[:80]
 
-    if not series_by_ticker:
+    if not collected[wanted[0]]:
         raise ValueError("No tickers could be fetched.")
 
-    prices = pd.DataFrame(series_by_ticker).sort_index()
-    prices.index = pd.DatetimeIndex(prices.index)
-    if prices.index.tz is not None:
-        prices.index = prices.index.tz_localize(None)
-    return prices[~prices.index.duplicated(keep="last")], failures
+    frames = {}
+    for name in wanted:
+        panel = pd.DataFrame(collected[name]).sort_index()
+        panel.index = pd.DatetimeIndex(panel.index)
+        if panel.index.tz is not None:
+            panel.index = panel.index.tz_localize(None)
+        frames[name] = panel[~panel.index.duplicated(keep="last")]
+
+    # Every column shares the Close panel's shape, so factors can index across
+    # them without realigning.
+    reference = frames[wanted[0]]
+    for name in wanted[1:]:
+        frames[name] = frames[name].reindex(index=reference.index,
+                                            columns=reference.columns)
+
+    result = frames[wanted[0]] if len(wanted) == 1 else frames
+    return result, failures
+
+
+def fetch_series(ticker, period="max", interval="1d", column="Close"):
+    """One series, for things like USDTRY that are not part of the universe."""
+    frame, _meta = data_cache.get_ohlcv(ticker, period, interval, adjusted=False)
+    if column not in frame.columns:
+        raise ValueError(f"{ticker} has no '{column}' column")
+    values = pd.to_numeric(frame[column], errors="coerce")
+    values = values[values > 0]
+    if values.empty:
+        raise ValueError(f"{ticker} returned no positive prices")
+    values.index = pd.DatetimeIndex(values.index)
+    if values.index.tz is not None:
+        values.index = values.index.tz_localize(None)
+    return values[~values.index.duplicated(keep="last")].sort_index()
 
 
 def coverage_report(prices):

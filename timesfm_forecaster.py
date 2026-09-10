@@ -493,7 +493,13 @@ class TimesFMApp:
 
         self.xs_long_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(controls, text="Long only", variable=self.xs_long_only_var
-                        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+                        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        # Ranking in lira partly sorts on currency sensitivity rather than on
+        # how the businesses actually did.
+        self.xs_usd_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls, text="Rank in USD", variable=self.xs_usd_var
+                        ).grid(row=1, column=1, sticky="w", pady=(6, 0))
 
         self.xs_vol_target_on = tk.BooleanVar(value=True)
         ttk.Checkbutton(controls, text="Volatility target (HAR-RV)",
@@ -512,7 +518,8 @@ class TimesFMApp:
         results.pack(fill="both", expand=True, padx=10, pady=(5, 10))
 
         columns = ("Factor", "Freq", "Years", "CAGR", "Sharpe net", "Sharpe gross",
-                   "MaxDD", "Hit", "Turnover/yr", "Cost drag", "Lev", "IC", "IC t")
+                   "DSR", "Trials", "MaxDD", "Hit", "Turnover/yr", "Cost drag",
+                   "Lev", "IC", "IC t")
         self.xs_tree = ttk.Treeview(results, columns=columns, show="headings", height=8)
         for column in columns:
             self.xs_tree.heading(column, text=column)
@@ -541,12 +548,26 @@ class TimesFMApp:
                 self.root.after(0, lambda: self.xs_status.config(
                     text=f"Fetching {done}/{total}: {ticker}"))
 
-            prices, failures = universe.fetch_panel(
+            frames, failures = universe.fetch_panel(
                 tickers, period=self.period_var.get(), interval=self.interval_var.get(),
                 # Raw prices: adjusted closes embed later corporate actions.
-                adjusted=False, progress_cb=progress,
+                adjusted=False, columns=["Close", "Open"], progress_cb=progress,
             )
+            prices = frames["Close"]
             self.universe_prices = prices
+            self.universe_panels = frames
+
+            # USDTRY is fetched once here so the USD ranking does not have to
+            # hit the network mid-backtest.
+            self.universe_fx = None
+            try:
+                self.universe_fx = universe.fetch_series(
+                    "USDTRY=X", period=self.period_var.get(),
+                    interval=self.interval_var.get())
+            except Exception as fx_error:
+                self.root.after(0, self.log_message,
+                                f"USDTRY unavailable, so USD ranking is off: {fx_error}",
+                                "warning")
             report = universe.coverage_report(prices)
             self.root.after(0, self._on_universe_fetched, report, failures)
         except Exception as error:
@@ -588,28 +609,74 @@ class TimesFMApp:
     def _run_cross_sectional_job(self):
         try:
             prices = self.universe_prices
+            panels = getattr(self, "universe_panels", None)
             factor_name = self.xs_factor_var.get()
             frequency = self.xs_freq_var.get()
             quantile = float(self.xs_quantile_var.get())
             vol_target = float(self.xs_vol_target_var.get()) if self.xs_vol_target_on.get() else None
 
-            self.root.after(0, self.log_message,
-                            f"Cross-sectional: {factor_name}, {frequency} rebalance, "
-                            f"top/bottom {quantile:.0%}, "
-                            f"{'long only' if self.xs_long_only_var.get() else 'long/short'}"
-                            + (f", vol target {vol_target:.0%}" if vol_target else ""))
+            if factor_name in cross_sectional.NEEDS_OPEN and (
+                    not panels or "Open" not in panels):
+                raise ValueError(
+                    f"{factor_name} needs opening prices. Refetch the universe "
+                    "so the Open panel is loaded."
+                )
 
-            factor = cross_sectional.FACTORS[factor_name](prices)
+            currency = "TRY"
+            if self.xs_usd_var.get():
+                fx = getattr(self, "universe_fx", None)
+                if fx is None:
+                    raise ValueError("USDTRY was not loaded; refetch the universe.")
+                prices = cross_sectional.to_usd(prices, fx)
+                if panels:
+                    panels = {name: cross_sectional.to_usd(frame, fx)
+                              for name, frame in panels.items()}
+                currency = "USD"
+                if factor_name in cross_sectional.FX_RANK_INVARIANT:
+                    self.root.after(0, self.log_message,
+                                    f"{factor_name} is a ratio factor, so converting to USD "
+                                    "cannot change its ranking - only the return stream you "
+                                    "earn on it. Use a volatility-based factor if you want the "
+                                    "currency to affect selection.", "warning")
+
+            # Every configuration ever run counts against this result.
+            trials = max(db_manager.count_backtest_runs("xs:") + 1, 1)
+
+            self.root.after(0, self.log_message,
+                            f"Cross-sectional: {factor_name} in {currency}, {frequency} "
+                            f"rebalance, top/bottom {quantile:.0%}, "
+                            f"{'long only' if self.xs_long_only_var.get() else 'long/short'}"
+                            + (f", vol target {vol_target:.0%}" if vol_target else "")
+                            + f" - trial #{trials}")
+
+            factor = cross_sectional.FACTORS[factor_name](prices, panels)
             result = cross_sectional.run(
                 prices, factor=factor, frequency=frequency,
                 top_quantile=quantile, bottom_quantile=quantile,
                 long_only=self.xs_long_only_var.get(),
                 cost_bps=float(self.xs_cost_var.get()),
-                vol_target=vol_target,
+                vol_target=vol_target, panels=panels, n_trials=trials,
             )
             ic = cross_sectional.information_coefficient(prices, factor, frequency)
-            self.root.after(0, self._on_cross_sectional_done, factor_name, frequency,
-                            result, ic)
+
+            label = f"xs:{factor_name}@{frequency}/{currency}"
+            try:
+                db_manager.insert_backtest_run(
+                    ticker=f"UNIVERSE({prices.shape[1]})",
+                    interval=self.interval_var.get(), period=self.period_var.get(),
+                    model_name=label, context_length=0,
+                    horizon_length=0, step=0, mode=frequency,
+                    adjusted=False, cost_bps=float(self.xs_cost_var.get()),
+                    n_origins=result["rebalances"],
+                    n_points=result["summary"].get("n_days"),
+                    summary={**result["summary"], **ic},
+                )
+            except Exception as save_error:
+                self.root.after(0, self.log_message,
+                                f"Could not store the run: {save_error}", "warning")
+
+            self.root.after(0, self._on_cross_sectional_done, f"{factor_name} [{currency}]",
+                            frequency, result, ic)
         except Exception as error:
             self.root.after(0, self._on_cross_sectional_error,
                             f"{str(error)}\n{traceback.format_exc()}")
@@ -628,6 +695,8 @@ class TimesFMApp:
             self._fmt(summary.get("cagr_net"), ".1f", 100.0, "%"),
             self._fmt(summary.get("sharpe_net"), ".2f"),
             self._fmt(summary.get("sharpe_gross"), ".2f"),
+            self._fmt(summary.get("deflated_sharpe"), ".2f"),
+            summary.get("n_trials", 1),
             self._fmt(summary.get("max_drawdown"), ".1f", 100.0, "%"),
             self._fmt(summary.get("hit_rate"), ".0f", 100.0, "%"),
             self._fmt(summary.get("turnover_annual"), ".1f") + "x",
@@ -644,6 +713,24 @@ class TimesFMApp:
             f"max drawdown {self._fmt(summary.get('max_drawdown'), '.1f', 100.0, '%')}, "
             f"IC {self._fmt(ic.get('ic_mean'), '.3f')} (t={self._fmt(ic.get('ic_t_stat'), '.1f')})"
         )
+
+        # The deflated Sharpe is the number that decides whether any of this is
+        # believable. Below 0.95 means the result is within what a search over
+        # this many configurations would produce from noise alone.
+        deflated = summary.get("deflated_sharpe")
+        trials = summary.get("n_trials", 1)
+        single = summary.get("probabilistic_sharpe")
+        if deflated is not None and deflated == deflated:
+            self.log_message(
+                f"Deflated Sharpe {deflated:.2f} after {trials} trial(s)"
+                + (f" (it would be {single:.2f} on a single trial)" if single == single else "")
+                + ".",
+                "info" if deflated >= 0.95 else "warning")
+            if deflated < 0.95:
+                self.log_message(
+                    "Below 0.95: a search over this many configurations produces a "
+                    "result this good from noise often enough that it is not evidence.",
+                    "warning")
 
         # An IC t-stat below ~2 means the factor has not demonstrated it knows
         # anything, whatever the Sharpe looks like.

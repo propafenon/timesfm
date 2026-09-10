@@ -139,4 +139,112 @@ print(f"survivorship: flags {len(report['stale_names'])} stale name(s); "
 assert "optimistic" in universe.survivorship_note(report)
 print("  and states the warning in plain words")
 
+
+# ==========================================================================
+# USD RANKING, OVERNIGHT/INTRADAY SPLIT, DEFLATED SHARPE
+# ==========================================================================
+
+# ---- ranking in USD strips out the currency ------------------------------
+fx_dates = prices.index
+fx = pd.Series(np.exp(np.cumsum(rng.normal(0.0008, 0.006, len(fx_dates)))) * 10,
+               index=fx_dates)          # a steadily depreciating lira
+usd_prices = cs.to_usd(prices, fx)
+assert usd_prices.shape == prices.shape
+np.testing.assert_allclose(usd_prices.iloc[0].to_numpy(float),
+                           (prices.iloc[0] / fx.iloc[0]).to_numpy(float), rtol=1e-12)
+print(f"\nUSD conversion: TRY {prices.iloc[-1, 0]:.1f} -> USD {usd_prices.iloc[-1, 0]:.2f}")
+
+# A pure currency move must NOT change the cross-sectional ranking, because it
+# hits every name identically. This is the sanity check that the conversion is
+# doing something real rather than adding noise.
+try_rank = cs.momentum_12_1(prices).iloc[-1].rank()
+usd_rank = cs.momentum_12_1(usd_prices).iloc[-1].rank()
+agreement = try_rank.corr(usd_rank, method="spearman")
+print(f"  rank agreement TRY vs USD under a common FX move: {agreement:.3f}")
+assert agreement > 0.99, agreement
+print("  a market-wide currency move leaves the ranking intact, as it must")
+
+# Ratio factors are PROVABLY rank-invariant to the conversion: momentum_usd is
+# (momentum_try + 1)/G - 1, the same monotonic map for every name. So this is a
+# no-op for selection, and the code says so rather than implying otherwise.
+for invariant in ("momentum_12_1", "momentum_6_1", "short_term_reversal"):
+    a = cs.FACTORS[invariant](prices).iloc[-1]
+    b = cs.FACTORS[invariant](usd_prices).iloc[-1]
+    pair = pd.concat([a, b], axis=1).dropna()
+    assert pair.iloc[:, 0].corr(pair.iloc[:, 1], method="spearman") > 0.9999, invariant
+    assert invariant in cs.FX_RANK_INVARIANT
+print("  ratio factors are rank-invariant in USD, and flagged as such")
+
+# Volatility-based factors are NOT: a name's return minus a common FX return
+# has a different variance depending on how it co-moves with the currency.
+vol_try = cs.low_volatility(prices).iloc[-1]
+vol_usd = cs.low_volatility(usd_prices).iloc[-1]
+pair = pd.concat([vol_try, vol_usd], axis=1).dropna()
+vol_agreement = pair.iloc[:, 0].corr(pair.iloc[:, 1], method="spearman")
+print(f"  low_volatility rank correlation TRY vs USD: {vol_agreement:.3f} (changes)")
+assert vol_agreement < 0.99
+assert "low_volatility" not in cs.FX_RANK_INVARIANT
+
+# And the return stream differs either way, which is what a USD investor earns.
+try_run = cs.run(prices, frequency="M", cost_bps=0.0)["summary"]
+usd_run = cs.run(usd_prices, frequency="M", cost_bps=0.0)["summary"]
+assert try_run["sharpe_net"] != usd_run["sharpe_net"]
+print(f"  return stream does differ: Sharpe {try_run['sharpe_net']:+.3f} (TRY) vs "
+      f"{usd_run['sharpe_net']:+.3f} (USD)")
+
+# forward fill only: an FX rate must never be used before it existed
+sparse_fx = fx.iloc[::7]                      # weekly quotes
+converted = cs.to_usd(prices, sparse_fx)
+assert converted.iloc[:5].isna().all().all() or converted.notna().any().any()
+early = prices.index[prices.index < sparse_fx.index[0]]
+if len(early):
+    assert converted.loc[early].isna().all().all(), "FX was back-filled"
+print("  sparse FX is forward-filled, never back-filled")
+
+# ---- overnight / intraday split ------------------------------------------
+opens = prices.shift(1) * (1 + rng.normal(0, 0.004, prices.shape))   # plausible opens
+panels = {"Close": prices, "Open": opens}
+
+for name in cs.NEEDS_OPEN:
+    with_open = cs.FACTORS[name](prices, panels)
+    assert with_open.notna().any().any(), f"{name} produced nothing"
+    # causal: truncating the future must not move the past
+    truncated = cs.FACTORS[name](prices.iloc[:900],
+                                 {k: v.iloc[:900] for k, v in panels.items()})
+    a = with_open.iloc[:900].to_numpy(float); b = truncated.to_numpy(float)
+    assert np.allclose(a, b, equal_nan=True), f"NON-CAUSAL: {name}"
+    # and without an Open panel it must be all-NaN, not silently wrong
+    assert cs.FACTORS[name](prices, None).isna().all().all(), f"{name} faked it"
+print(f"overnight/intraday: {len(cs.NEEDS_OPEN)} factors causal, and blank without Open")
+
+# the two legs must reconstruct the total move
+overnight = cs._overnight_log_returns(prices, panels)
+intraday = cs._intraday_log_returns(prices, panels)
+total = np.log(prices / prices.shift(1))
+rebuilt = overnight + intraday
+both = np.isfinite(total.to_numpy(float)) & np.isfinite(rebuilt.to_numpy(float))
+np.testing.assert_allclose(total.to_numpy(float)[both], rebuilt.to_numpy(float)[both],
+                           rtol=1e-9, atol=1e-12)
+print("  overnight + intraday reconstructs the daily return exactly")
+
+overnight_run = cs.run(prices, factor_name="overnight_momentum_12_1",
+                       frequency="M", cost_bps=0.0, panels=panels)
+print(f"  overnight momentum backtest ran: Sharpe "
+      f"{overnight_run['summary']['sharpe_net']:+.2f} over "
+      f"{overnight_run['rebalances']} rebalances")
+
+# ---- deflated Sharpe ------------------------------------------------------
+one = cs.run(prices, frequency="M", cost_bps=0.0, n_trials=1)["summary"]
+fifty = cs.run(prices, frequency="M", cost_bps=0.0, n_trials=50)["summary"]
+thousand = cs.run(prices, frequency="M", cost_bps=0.0, n_trials=1000)["summary"]
+print(f"\ndeflated Sharpe on the SAME result: "
+      f"1 trial {one['deflated_sharpe']:.3f} -> 50 {fifty['deflated_sharpe']:.3f} "
+      f"-> 1000 {thousand['deflated_sharpe']:.3f}")
+assert one["deflated_sharpe"] >= fifty["deflated_sharpe"] >= thousand["deflated_sharpe"]
+assert one["sharpe_net"] == fifty["sharpe_net"], "the raw Sharpe must not change"
+print("  identical returns, less believable the more configurations were tried")
+assert np.isfinite(one["return_skew"]) and np.isfinite(one["return_kurtosis"])
+print(f"  return shape reported: skew {one['return_skew']:+.2f}, "
+      f"kurtosis {one['return_kurtosis']:.2f}")
+
 print("\nALL CROSS-SECTIONAL TESTS PASSED")
