@@ -88,6 +88,7 @@ class TimesFMApp:
         self.current_model_config = {}
         self.validation_forecast_data = None
         self.validation_metrics = []
+        self.validation_summary = {}
         self.validation_origin = None
         self.validation_record_saved = False
         # What the live forecast was conditioned on, captured at inference time.
@@ -851,6 +852,12 @@ class TimesFMApp:
         self.validation_ratio_var = tk.DoubleVar(value=0.2)
         ttk.Entry(model_frame, textvariable=self.validation_ratio_var, width=10).grid(row=4, column=1, sticky="e", pady=2)
 
+        # The held-out window is walked, not scored once, so this bounds how
+        # many inferences that costs.
+        ttk.Label(model_frame, text="Validation origins (max):").grid(row=10, column=0, sticky="w", pady=2)
+        self.validation_origins_var = tk.IntVar(value=30)
+        ttk.Entry(model_frame, textvariable=self.validation_origins_var, width=10).grid(row=10, column=1, sticky="e", pady=2)
+
         # Levels make the model track trend and contaminate MASE with drift.
         # Returns are stationary and are what a trade actually depends on.
         ttk.Label(model_frame, text="Model in:").grid(row=9, column=0, sticky="w", pady=2)
@@ -1329,53 +1336,6 @@ class TimesFMApp:
             return "-"
         return "-" if number != number else format(number, spec) + suffix
 
-    def _calculate_validation_metrics(self, actual, predicted, baseline):
-        """Return common accuracy metrics as a list of ``(name, value)`` tuples."""
-        actual = np.asarray(actual, dtype=float).reshape(-1)
-        predicted = np.asarray(predicted, dtype=float).reshape(-1)
-        length = min(actual.size, predicted.size)
-        actual = actual[:length]
-        predicted = predicted[:length]
-        valid = np.isfinite(actual) & np.isfinite(predicted)
-        actual = actual[valid]
-        predicted = predicted[valid]
-        if actual.size == 0:
-            return []
-
-        error = predicted - actual
-        absolute_error = np.abs(error)
-        denominator = np.maximum(np.abs(actual), np.finfo(float).eps)
-        smape_denominator = np.maximum(np.abs(actual) + np.abs(predicted), np.finfo(float).eps)
-        ss_total = np.sum((actual - np.mean(actual)) ** 2)
-        r_squared = 1.0 - np.sum(error ** 2) / ss_total if ss_total > 0 else float("nan")
-        if actual.size > 1:
-            actual_direction = np.sign(np.diff(np.concatenate(([baseline], actual))))
-            predicted_direction = np.sign(np.diff(np.concatenate(([baseline], predicted))))
-            # Score only steps where both sides have a direction: a flat
-            # forecast expresses no view, and counting it wrong reports a naive
-            # baseline as 0% accurate.
-            scored = (actual_direction != 0) & (predicted_direction != 0)
-            directional_accuracy = (
-                float(np.mean(actual_direction[scored] == predicted_direction[scored]))
-                if scored.any() else float("nan")
-            )
-        else:
-            directional_accuracy = float("nan")
-        # MAE alone cannot say whether the forecast beat "no change", so report
-        # it against that baseline explicitly. MASE < 1 means real skill.
-        naive_mae = float(np.mean(np.abs(actual - baseline)))
-        skill = 1.0 - float(np.mean(absolute_error)) / naive_mae if naive_mae > 0 else float("nan")
-        return [
-            ("MAE", float(np.mean(absolute_error))),
-            ("NaiveMAE", naive_mae),
-            ("SkillVsNaive", skill),
-            ("RMSE", float(np.sqrt(np.mean(error ** 2)))),
-            ("MAPE", float(np.mean(absolute_error / denominator) * 100)),
-            ("sMAPE", float(np.mean(2 * absolute_error / smape_denominator) * 100)),
-            ("R2", float(r_squared)),
-            ("DirectionalAccuracy", directional_accuracy),
-        ]
-
     def thread_run_forecast(self):
         if self.is_processing: return
         if self.historical_data is None or self.historical_data.empty:
@@ -1499,8 +1459,12 @@ class TimesFMApp:
             
             self.root.after(0, self.log_message, "Running inference on prepared context data...")
 
-            # Computed on the real series length. Previously this used the
-            # padded length, so split_index could point past the end of the data.
+            # Validation is a walk-forward over the held-out tail, not a single
+            # split. Scoring one origin gave `horizon` points - 7 here - no
+            # matter how much data was held out: a 0.2 ratio on 500 bars reserved
+            # 100 and threw 93 of them away. Seven points cannot separate skill
+            # from luck, and a config change swung the headline number from -5%
+            # to +28% on exactly that evidence.
             series_length = len(time_series)
             validation_size = max(1, int(np.ceil(series_length * validation_ratio)))
             validation_size = min(validation_size, max(series_length - input_patch_len, 1))
@@ -1511,31 +1475,112 @@ class TimesFMApp:
                     f"{validation_size} for validation. Fetch a longer period or "
                     "lower the validation ratio."
                 )
-            validation_horizon = min(horizon, validation_size)
-            validation_context = self._prepare_context(time_series, split_index, context_len)
-            validation_covariates = self._prepare_covariate_context(
-                split_index + row_offset, context_len, selected_covariates
+
+            # Score in price space whatever the model was fitted on, so the naive
+            # reference stays "no change" and the numbers stay comparable.
+            validation_values = np.asarray(price_series, dtype=float).reshape(-1)
+            validation_dates = frame_index
+            validation_model = self._timesfm_model_fn(horizon)
+            if space != transforms.PRICE:
+                validation_model = backtest.in_return_space(validation_model, space)
+
+            covariate_matrix, covariates_used = self._backtest_covariate_matrix(
+                selected_covariates
             )
-            validation_prediction = self._predict_loaded_model(
-                validation_context, validation_covariates, validation_horizon
+
+            first_origin = split_index - 1 + row_offset
+            last_origin = len(validation_values) - horizon - 1
+            candidates = list(range(first_origin, last_origin + 1))
+            if not candidates:
+                raise ValueError(
+                    f"The held-out window is shorter than the {horizon}-step horizon. "
+                    "Lower the horizon or raise the validation ratio."
+                )
+
+            max_origins = max(int(self.validation_origins_var.get()), 1)
+            origin_step = max(1, int(np.ceil(len(candidates) / max_origins)))
+            chosen_origins = candidates[::origin_step]
+
+            self.root.after(0, self.log_message,
+                            f"Validating across {len(chosen_origins)} origin(s) of the "
+                            f"{validation_size}-bar hold-out (every {origin_step} bar(s)), "
+                            f"{horizon} steps each.")
+
+            validation_rows = backtest.walk_forward(
+                validation_values, validation_dates, validation_model,
+                context_len, horizon, origin_step, mode="sliding",
+                origins=chosen_origins, covariates=covariate_matrix,
             )
-            validation_actual = time_series[split_index:split_index + validation_horizon]
-            self.validation_forecast_data = validation_prediction
-            self.validation_metrics = self._calculate_validation_metrics(
-                validation_actual,
-                validation_prediction,
-                time_series[split_index - 1],
+
+            summary = backtest.summarize(
+                validation_rows, interval=self.interval_var.get(),
+                n_trials=max(db_manager.count_forecast_runs(), 1),
             )
-            self.validation_origin = pd.Timestamp(series_dates[split_index - 1]).isoformat()
+            self.validation_summary = summary
+            self.validation_rows = validation_rows
+            self.validation_forecast_data = np.asarray(
+                [row["y_pred"] for row in validation_rows if row["origin_index"] == chosen_origins[-1]],
+                dtype=float,
+            )
+            self.validation_metrics = [
+                ("Points", float(summary.get("n_points", 0))),
+                ("Origins", float(summary.get("n_origins", 0))),
+                ("MAE", summary.get("mae")),
+                ("NaiveMAE", summary.get("naive_mae")),
+                ("SkillVsNaive", summary.get("skill_vs_naive")),
+                ("MASE_h1", summary.get("mase_step1")),
+                ("MASE_all", summary.get("mase")),
+                ("DirectionalAccuracy", summary.get("directional_accuracy")),
+                ("DM_p_vs_naive", summary.get("dm_pvalue_vs_naive")),
+            ]
+            self.validation_metrics = [
+                (name, value) for name, value in self.validation_metrics if value is not None
+            ]
+            self.validation_origin = pd.Timestamp(validation_dates[chosen_origins[-1]]).isoformat()
             self.validation_record_saved = False
+
+            # Persist it as a backtest run: a walk-forward over a held-out window
+            # is exactly that, and it belongs beside the others in the QC tab.
+            try:
+                run_id = db_manager.insert_backtest_run(
+                    ticker=self.tkr_var.get().strip().upper(),
+                    interval=self.interval_var.get(), period=self.period_var.get(),
+                    model_name=f"timesfm@validation({space})",
+                    context_length=context_len, horizon_length=horizon,
+                    step=origin_step, mode="sliding",
+                    adjusted=self.adjusted_var.get(), cost_bps=0.0,
+                    n_origins=summary.get("n_origins"), n_points=summary.get("n_points"),
+                    summary=summary,
+                )
+                db_manager.insert_backtest_points(run_id, validation_rows)
+                self.root.after(0, self.refresh_backtest_history)
+            except Exception as save_error:
+                self.root.after(0, self.log_message,
+                                f"Could not store the validation run: {str(save_error)}", "warning")
+
             self.root.after(
-                0,
-                self.log_message,
-                "Validation metrics: " + ", ".join(
+                0, self.log_message,
+                "Validation: " + ", ".join(
                     f"{name}={value:.4f}" for name, value in self.validation_metrics
-                    if np.isfinite(value)
+                    if value is not None and value == value
                 ),
             )
+
+            # State the conclusion, so a number that cannot support one is not
+            # mistaken for evidence.
+            skill = summary.get("skill_step1")
+            p_value = summary.get("dm_pvalue_vs_naive")
+            if skill is not None and skill == skill:
+                verdict = "beats naive at h=1" if skill > 0 else "does NOT beat naive at h=1"
+                significant = p_value is not None and p_value == p_value and p_value < 0.05
+                shown = "n/a" if p_value is None or p_value != p_value else format(p_value, ".3f")
+                self.root.after(
+                    0, self.log_message,
+                    f"Verdict: {verdict} ({skill * 100:+.1f}%); the difference is "
+                    + ("significant" if significant else "NOT significant")
+                    + f" (DM p={shown}).",
+                    "info" if (skill > 0 and significant) else "warning",
+                )
 
             # The real forecast uses the full historical context after validation.
             forecast_result, spread = self._predict_loaded_model(

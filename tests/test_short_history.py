@@ -77,9 +77,17 @@ print(f"forecast produced: {len(app.forecast_data)} steps")
 # Context clamped to a whole number of patches, not padded out to 1056.
 assert 1056 % 32 == 0
 expected = (n // 32) * 32
-for call in calls:
-    assert call["context_len"] == expected, (call["context_len"], expected)
+# The final call is the live forecast and gets exactly the clamped context.
+assert calls[-1]["context_len"] == expected, (calls[-1]["context_len"], expected)
+# Earlier calls are validation origins. At the start of the hold-out fewer than
+# `expected` real bars precede the origin, so the context is genuinely shorter.
+# That is correct: a short window of real data beats a padded window of a
+# repeated value, which is what the old code fed the model.
+assert all(c["context_len"] <= expected for c in calls), [c["context_len"] for c in calls]
+shortest = min(c["context_len"] for c in calls)
 print(f"context clamped to {expected} (= {n}//32*32), not padded to 1056")
+print(f"  live forecast context {calls[-1]['context_len']}; "
+      f"validation contexts {shortest}-{expected} (real bars, never padded)")
 assert "context reduced from 1056" in captured['log']
 
 # The context must be real data, not a repeated edge value.
@@ -90,8 +98,37 @@ print(f"context is real data: {calls[0]['unique']}/{expected} distinct values")
 origin = pd.Timestamp(app.validation_origin)
 assert idx[0] <= origin <= idx[-1], (origin, idx[0], idx[-1])
 print(f"validation origin {origin.date()} lies inside {idx[0].date()}..{idx[-1].date()}")
-assert app.validation_metrics and dict(app.validation_metrics).get("MAE") is not None
+metrics_by_name = dict(app.validation_metrics)
+assert metrics_by_name.get("MAE") is not None
 print("validation metrics computed:", ", ".join(k for k, _ in app.validation_metrics))
+
+# THE POINT OF THIS REWIRE: the hold-out is walked, not scored once. The old
+# code scored min(horizon, held_out) = 7 points no matter how much was reserved.
+points = int(metrics_by_name["Points"])
+origins = int(metrics_by_name["Origins"])
+print(f"validation walked {origins} origin(s) -> {points} scored points (was always 7)")
+assert origins > 1, "hold-out was scored at a single origin again"
+assert points > 7, f"only {points} scored points; the walk did not happen"
+assert points == origins * 7, (points, origins)
+
+# It must be bounded by the UI cap, so a long hold-out cannot run away.
+assert origins <= app.validation_origins_var.get(), (origins, app.validation_origins_var.get())
+print(f"bounded by the max-origins cap ({app.validation_origins_var.get()})")
+
+# A naive-reference comparison and a significance test must both be present.
+for required in ("NaiveMAE", "SkillVsNaive", "MASE_h1", "DM_p_vs_naive"):
+    assert required in metrics_by_name, required
+print("reports naive baseline, MASE and a Diebold-Mariano p-value")
+assert "Verdict:" in captured['log'], captured['log'][-600:]
+print("states an explicit verdict in the log")
+
+# And it is persisted as a backtest run, so it survives the session.
+runs = [r for r in db.get_backtest_runs() if "validation" in r["model_name"]]
+assert runs, "validation run was not stored"
+stored = db.get_backtest_points(runs[0]["id"])
+assert len(stored) == points, (len(stored), points)
+stored_name = runs[0]["model_name"]
+print(f"stored as backtest run '{stored_name}' with {len(stored)} points")
 
 assert pd.Timestamp(app.forecast_anchor) == idx[-1]
 print(f"forecast anchor is the last real bar: {pd.Timestamp(app.forecast_anchor).date()}")

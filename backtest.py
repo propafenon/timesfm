@@ -173,8 +173,13 @@ def plan_origins(n_observations, context_len, horizon, step, min_context=None):
 
 def walk_forward(values, dates, model_fn, context_len, horizon, step,
                  mode="sliding", min_context=None, quantile_levels=None,
-                 progress_cb=None, should_stop=None, covariates=None):
+                 progress_cb=None, should_stop=None, covariates=None,
+                 origins=None):
     """Roll an origin through history. Returns a list of per-step dicts.
+
+    `origins` restricts the roll to specific positions, for scoring only a
+    held-out tail rather than all of history. Each is still the index of the
+    last observed bar, and the leak-free slicing is unchanged.
 
     `covariates` is an optional (n_features, n_observations) matrix aligned to
     `values`. It is re-sliced at every origin exactly like the target, so the
@@ -195,7 +200,12 @@ def walk_forward(values, dates, model_fn, context_len, horizon, step,
             )
     wants_covariates = bool(getattr(model_fn, "wants_covariates", False))
 
-    origins = plan_origins(values.size, context_len, horizon, step, min_context)
+    if origins is None:
+        origins = plan_origins(values.size, context_len, horizon, step, min_context)
+    else:
+        # Keep only origins that leave a full horizon of truth behind them.
+        limit = values.size - horizon - 1
+        origins = [int(o) for o in origins if 0 <= int(o) <= limit]
     if not origins:
         raise ValueError(
             f"Not enough data: {values.size} bars cannot support a "
