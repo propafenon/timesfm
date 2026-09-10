@@ -152,8 +152,15 @@ class TimesFMApp:
         parent_notebook.add(tab_settings, text="Model Settings")
 
         # INFERENCE & VISUALIZATION TAB
-        left_panel = ttk.Frame(tab_inference, width=380, padding=(10, 10, 10, 10))
-        left_panel.pack(side="left", fill="y", expand=False)
+        # A paned window rather than two packed frames, so the divider between
+        # the settings and the plot can be dragged. The settings column carries
+        # long labels and file paths, and a fixed 380px forced them behind a
+        # scrollbar on every layout.
+        self.inference_paned = ttk.PanedWindow(tab_inference, orient=tk.HORIZONTAL)
+        self.inference_paned.pack(fill="both", expand=True)
+
+        left_panel = ttk.Frame(self.inference_paned, width=380, padding=(10, 10, 10, 10))
+        self.inference_paned.add(left_panel, weight=0)
 
         # Grid, not pack: a horizontal scrollbar has to sit under the canvas
         # without stealing the vertical one's column. Entries wider than the
@@ -172,7 +179,20 @@ class TimesFMApp:
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=self.settings_frame, anchor="nw")
+        settings_window = canvas.create_window((0, 0), window=self.settings_frame, anchor="nw")
+
+        def fit_settings_width(event):
+            """Stretch the settings content to the pane, never below its natural width.
+
+            Clamping at the natural width is what keeps the horizontal scrollbar
+            meaningful when the divider is dragged narrow.
+            """
+            canvas.itemconfigure(
+                settings_window,
+                width=max(event.width, self.settings_frame.winfo_reqwidth()),
+            )
+
+        canvas.bind("<Configure>", fit_settings_width)
         canvas.configure(yscrollcommand=scrollbar.set, xscrollcommand=h_scrollbar.set)
 
         canvas.grid(row=0, column=0, sticky="nsew")
@@ -301,8 +321,10 @@ class TimesFMApp:
         bind_settings_scroll(self.settings_frame)
         self.scan_local_models() # Auto-populate listbox on boot
         
-        right_panel = ttk.Frame(tab_inference, padding=(10, 10, 10, 10))
-        right_panel.pack(side="right", fill="both", expand=True)
+        right_panel = ttk.Frame(self.inference_paned, padding=(10, 10, 10, 10))
+        # weight=1: dragging the divider gives the extra space to the plot, and
+        # resizing the window grows the plot rather than the settings column.
+        self.inference_paned.add(right_panel, weight=1)
         right_panel.rowconfigure(0, weight=3) 
         right_panel.rowconfigure(1, weight=1) 
         right_panel.columnconfigure(0, weight=1)
@@ -323,6 +345,9 @@ class TimesFMApp:
         
         self.build_backtest_tab(tab_backtest)
         self.init_plot()
+
+        # sashpos only works once the widget has been mapped and sized.
+        self.root.after_idle(self._place_inference_sash)
 
     # ----------------------------------------------------------------
     # Backtest tab
@@ -718,6 +743,14 @@ class TimesFMApp:
                 f"skill={self._fmt(entry.get('skill_vs_naive'), '+.1f', 100.0, '%')}  "
                 f"dir={self._fmt(entry.get('directional_accuracy'), '.0f', 100.0, '%')}"
             )
+
+    def _place_inference_sash(self, position=380):
+        """Start the divider where the old fixed-width panel sat."""
+        try:
+            if self.inference_paned.winfo_width() > position + 120:
+                self.inference_paned.sashpos(0, position)
+        except tk.TclError:
+            pass          # not mapped yet; the default split is fine
 
     def build_data_settings(self):
         data_frame = ttk.LabelFrame(self.settings_frame, text="1. Data Farming (yfinance)", padding=(10, 5))
