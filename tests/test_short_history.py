@@ -116,9 +116,11 @@ assert origins <= app.validation_origins_var.get(), (origins, app.validation_ori
 print(f"bounded by the max-origins cap ({app.validation_origins_var.get()})")
 
 # A naive-reference comparison and a significance test must both be present.
-for required in ("NaiveMAE", "SkillVsNaive", "MASE_h1", "DM_p_vs_naive"):
+for required in ("NaiveMAE", "SkillVsNaive", "MASE_h1", "DM_p_h1", "DM_p_pooled"):
     assert required in metrics_by_name, required
-print("reports naive baseline, MASE and a Diebold-Mariano p-value")
+# The verdict quotes an h=1 skill, so it must quote the h=1 p-value with it.
+assert "DM_p_h1" in metrics_by_name and "DM_p_pooled" in metrics_by_name
+print("reports naive baseline, MASE, and both h=1 and pooled DM p-values")
 assert "Verdict:" in captured['log'], captured['log'][-600:]
 print("states an explicit verdict in the log")
 

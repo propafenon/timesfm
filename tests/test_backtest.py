@@ -133,4 +133,37 @@ except ValueError as error:
     message = str(error)          # the name is unbound after the except block
     assert "covariates must be" in message
 print("misaligned covariate matrix is refused:", message[:60])
+
+# ---- per-step DM must match the per-step skill it is quoted with ----------
+# A model that is sharp at h=1 and useless afterwards must not have its h=1
+# edge declared insignificant because the pooled test mixed in h=2..7.
+rng2 = np.random.default_rng(21)
+walk2 = 100 * np.exp(np.cumsum(rng2.normal(0, 0.01, 900)))
+dates3 = pd.bdate_range("2022-01-03", periods=900)
+_plan = iter(bt.plan_origins(len(walk2), context_len=64, horizon=5, step=3))
+def sharp_at_h1(context, horizon):
+    o = next(_plan)
+    truth = walk2[o + 1:o + 1 + horizon]
+    out = np.array(truth, dtype=float)
+    out[0] += rng2.normal(0, 0.02)                 # h=1 nearly exact
+    out[1:] = float(context[-1]) + rng2.normal(0, 3.0, horizon - 1)  # rest noise
+    return out, None
+srows = bt.walk_forward(walk2, dates3, sharp_at_h1, 64, 5, 3)
+ssum = bt.summarize(srows, interval="1d")
+
+print(f"\nh=1 skill {ssum['skill_step1']*100:+.1f}%  DM p(h=1) {ssum['dm_pvalue_step1']:.2e}  "
+      f"| pooled skill {ssum['skill_vs_naive']*100:+.1f}%  DM p(pooled) {ssum['dm_pvalue_vs_naive']:.3f}")
+assert ssum["skill_step1"] > 0.9, ssum["skill_step1"]
+assert ssum["dm_pvalue_step1"] < 0.01, ssum["dm_pvalue_step1"]
+# The two verdicts disagree in SIGN: strong skill at h=1, worse than naive
+# pooled. Quoting the pooled p-value beside the h=1 skill - which the verdict
+# line used to do - therefore judges a claim against unrelated evidence.
+assert ssum["skill_vs_naive"] < 0 < ssum["skill_step1"], (
+    ssum["skill_vs_naive"], ssum["skill_step1"])
+print("PER-STEP DM: h=1 skill is significant while the pooled result reverses sign")
+print("  -> the verdict must quote the p-value matching the horizon it claims")
+
+for entry in ssum["by_step"]:
+    assert "dm_pvalue" in entry, entry.keys()
+print("every horizon step carries its own DM statistic")
 print("\nALL BACKTEST TESTS PASSED")

@@ -222,29 +222,8 @@ class TimesFMApp:
 
         bind_wheel(canvas, lambda widget, sequence: widget.bind_all(sequence, scroll_settings))
 
-        def inside_macro_list(widget):
-            """True if `widget` is the covariate canvas or lives inside it."""
-            macro_canvas = getattr(self, "macro_canvas", None)
-            if macro_canvas is None:
-                return False
-            node = widget
-            while node is not None:
-                if node == macro_canvas:
-                    return True
-                parent_name = node.winfo_parent()
-                if not parent_name:
-                    return False
-                node = node.nametowidget(parent_name)
-            return False
-
         def bind_settings_scroll(widget):
             """Give nested settings controls a direct chance to handle touchpad events."""
-            # The covariate list is its own scroller. Binding the outer handler
-            # to it too would win (it is added first and returns "break"), so the
-            # inner canvas would never see a wheel event and the 27-item list
-            # could not be scrolled at all.
-            if inside_macro_list(widget):
-                return
             bind_wheel(widget, lambda w, sequence: w.bind(sequence, scroll_settings, add="+"))
             for child in widget.winfo_children():
                 bind_settings_scroll(child)
@@ -774,51 +753,17 @@ class TimesFMApp:
         self.macro_count_label = ttk.Label(preset_row, text="")
         self.macro_count_label.pack(side=tk.LEFT, padx=(8, 0))
 
-        # 27 checkboxes do not fit a fixed panel, so give them their own
-        # scroller. The scrollbar must sit BESIDE the canvas: packing a vertical
-        # bar to "top" with fill="x" renders a dead strip that scrolls nothing.
-        macro_holder = ttk.Frame(features_frame)
-        macro_holder.pack(fill=tk.X, pady=(2, 0))
-
-        self.macro_canvas = tk.Canvas(macro_holder, height=220, highlightthickness=0)
-        macro_scroll = ttk.Scrollbar(macro_holder, orient="vertical",
-                                     command=self.macro_canvas.yview)
-        macro_inner = ttk.Frame(self.macro_canvas)
-        macro_inner.bind("<Configure>",
-                         lambda e: self.macro_canvas.configure(
-                             scrollregion=self.macro_canvas.bbox("all")))
-        self.macro_canvas.create_window((0, 0), window=macro_inner, anchor="nw")
-        self.macro_canvas.configure(yscrollcommand=macro_scroll.set)
-
-        self.macro_canvas.pack(side="left", fill="both", expand=True)
-        macro_scroll.pack(side="right", fill="y")
-
-        def scroll_macro(event):
-            """Scroll the covariate list, and stop the event reaching the panel."""
-            number = getattr(event, "num", None)
-            if number in (4, 6):
-                amount = -1
-            elif number in (5, 7):
-                amount = 1
-            else:
-                amount = -1 if getattr(event, "delta", 0) > 0 else 1
-            self.macro_canvas.yview_scroll(amount, "units")
-            return "break"
-
-        self._scroll_macro = scroll_macro
-
+        # Deliberately NOT a nested scroller. The settings panel is already a
+        # scrolling canvas, and putting a second one inside it meant the inner
+        # list was clipped by the outer viewport: the wheel scrolled content
+        # that had nowhere to appear, so the list read as frozen. One scroller,
+        # checkbuttons straight into the panel, and the panel grows to fit.
         for label, (source, symbol) in self.external_sources.items():
             variable = tk.BooleanVar(value=label in features.DEFAULT_MACRO_SELECTION)
             variable.trace_add("write", lambda *_: self._update_macro_count())
             self.external_source_vars[label] = variable
-            ttk.Checkbutton(macro_inner, text=f"{label}  [{source}:{symbol}]",
+            ttk.Checkbutton(features_frame, text=f"{label}  [{source}:{symbol}]",
                             variable=variable).pack(anchor="w")
-
-        # Bind after the checkbuttons exist so every row responds to the wheel.
-        self._bind_macro_wheel(self.macro_canvas)
-        self._bind_macro_wheel(macro_inner)
-        for child in macro_inner.winfo_children():
-            self._bind_macro_wheel(child)
 
         ttk.Label(features_frame, text="Custom sources (yahoo:SYMBOL or fred:SERIES_ID, comma-separated):").pack(anchor="w", pady=(4, 0))
         self.custom_source_var = tk.StringVar()
@@ -1080,17 +1025,6 @@ class TimesFMApp:
         if values.empty:
             raise ValueError("no numeric observations")
         return values
-
-    def _bind_macro_wheel(self, widget):
-        """Wheel bindings for the covariate list, including X11 scroll buttons."""
-        sequences = ["<MouseWheel>", "<Shift-MouseWheel>", "<Option-MouseWheel>"]
-        if sys.platform.startswith("linux"):
-            sequences += ["<Button-4>", "<Button-5>", "<Button-6>", "<Button-7>"]
-        for sequence in sequences:
-            try:
-                widget.bind(sequence, self._scroll_macro, add="+")
-            except tk.TclError:
-                pass
 
     def _apply_macro_preset(self, preset):
         for label, variable in self.external_source_vars.items():
@@ -1531,7 +1465,8 @@ class TimesFMApp:
                 ("MASE_h1", summary.get("mase_step1")),
                 ("MASE_all", summary.get("mase")),
                 ("DirectionalAccuracy", summary.get("directional_accuracy")),
-                ("DM_p_vs_naive", summary.get("dm_pvalue_vs_naive")),
+                ("DM_p_h1", summary.get("dm_pvalue_step1")),
+                ("DM_p_pooled", summary.get("dm_pvalue_vs_naive")),
             ]
             self.validation_metrics = [
                 (name, value) for name, value in self.validation_metrics if value is not None
@@ -1569,7 +1504,8 @@ class TimesFMApp:
             # State the conclusion, so a number that cannot support one is not
             # mistaken for evidence.
             skill = summary.get("skill_step1")
-            p_value = summary.get("dm_pvalue_vs_naive")
+            # Matched to the skill it is quoted beside: both are h=1.
+            p_value = summary.get("dm_pvalue_step1")
             if skill is not None and skill == skill:
                 verdict = "beats naive at h=1" if skill > 0 else "does NOT beat naive at h=1"
                 significant = p_value is not None and p_value == p_value and p_value < 0.05

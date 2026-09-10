@@ -319,6 +319,12 @@ def summarize(rows, interval="1d", cost_bps=10.0, n_trials=1):
     if summary["by_step"]:
         summary["mase_step1"] = summary["by_step"][0]["mase"]
         summary["skill_step1"] = summary["by_step"][0]["skill_vs_naive"]
+        # The h=1 skill must be judged against an h=1 significance test. The
+        # pooled p-value above mixes all horizons, so quoting it beside a
+        # single-step skill compares two different quantities and can report a
+        # large h=1 edge as insignificant purely because h=2..7 washed it out.
+        summary["dm_stat_step1"] = summary["by_step"][0].get("dm_stat")
+        summary["dm_pvalue_step1"] = summary["by_step"][0].get("dm_pvalue")
 
     summary.update(_return_space(frame))
     summary.update(_distributional(frame))
@@ -340,7 +346,18 @@ def per_step(frame):
 
         step_mae = metrics.mae(y_true, y_pred)
         naive_step_mae = metrics.mae(y_true, y_naive)
+
+        # Within one step every row is a different origin, so successive errors
+        # overlap only when origins are closer together than the step index.
+        # Lagging by the step index is the conservative choice; at h=1 it
+        # reduces to the standard no-autocorrelation test.
+        step_stat, step_p = metrics.diebold_mariano(
+            y_pred - y_true, y_naive - y_true,
+            horizon=max(int(step_value), 1), loss="squared",
+        )
         out.append({
+            "dm_stat": step_stat,
+            "dm_pvalue": step_p,
             "step": int(step_value),
             "n": int(len(chunk)),
             "mae": step_mae,
