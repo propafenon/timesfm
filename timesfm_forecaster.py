@@ -102,6 +102,8 @@ class TimesFMApp:
         self.model_lock = threading.Lock()
         # These collections describe the fetched feature table and its UI selections.
         self.feature_catalog = []
+        self.feature_selected = set()
+        self.feature_shown = []
         self.external_source_vars = {}
         
         self.root.columnconfigure(0, weight=0)
@@ -224,6 +226,11 @@ class TimesFMApp:
 
         def bind_settings_scroll(widget):
             """Give nested settings controls a direct chance to handle touchpad events."""
+            # The covariate table has its own scrollbar and handler. Binding the
+            # panel handler here too would win, because it is added first and
+            # returns "break", leaving the list unscrollable.
+            if widget is getattr(self, "feature_listbox", None):
+                return
             bind_wheel(widget, lambda w, sequence: w.bind(sequence, scroll_settings, add="+"))
             for child in widget.winfo_children():
                 bind_settings_scroll(child)
@@ -778,8 +785,58 @@ class TimesFMApp:
                         variable=self.force_refresh_var).pack(anchor="w")
 
         ttk.Label(features_frame, text="Model covariates (select after fetching):").pack(anchor="w", pady=(6, 0))
-        self.feature_listbox = tk.Listbox(features_frame, height=8, selectmode=tk.MULTIPLE, exportselection=False)
-        self.feature_listbox.pack(fill=tk.X, pady=(2, 0))
+        # ~49 rows land here after fetching (OHLCV + 40 engineered columns +
+        # macro series), so a fixed 8-row box with no scrollbar showed a sixth
+        # of the table with no way to reach the rest.
+        feature_tools = ttk.Frame(features_frame)
+        feature_tools.pack(fill=tk.X, pady=(2, 0))
+        ttk.Label(feature_tools, text="Filter:").pack(side=tk.LEFT)
+        self.feature_filter_var = tk.StringVar()
+        ttk.Entry(feature_tools, textvariable=self.feature_filter_var, width=12).pack(side=tk.LEFT, padx=(2, 4))
+        self.feature_filter_var.trace_add("write", lambda *_: self._render_feature_list())
+        ttk.Button(feature_tools, text="All", width=4,
+                   command=lambda: self._select_features("all")).pack(side=tk.LEFT)
+        ttk.Button(feature_tools, text="None", width=6,
+                   command=lambda: self._select_features("none")).pack(side=tk.LEFT, padx=2)
+        self.feature_count_label = ttk.Label(feature_tools, text="0 selected")
+        self.feature_count_label.pack(side=tk.LEFT, padx=(6, 0))
+
+        feature_holder = ttk.Frame(features_frame)
+        feature_holder.pack(fill=tk.X, pady=(2, 0))
+        self.feature_listbox = tk.Listbox(feature_holder, height=16,
+                                          selectmode=tk.MULTIPLE, exportselection=False)
+        feature_scroll = ttk.Scrollbar(feature_holder, orient="vertical",
+                                       command=self.feature_listbox.yview)
+        self.feature_listbox.configure(yscrollcommand=feature_scroll.set)
+        self.feature_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        feature_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Selection lives in a set, not in the widget: filtering repopulates the
+        # listbox, and a covariate hidden by the filter must stay selected.
+        self.feature_selected = set()
+        self.feature_shown = []
+        self.feature_listbox.bind("<<ListboxSelect>>", self._on_feature_select)
+
+        def scroll_features(event):
+            """Scroll the listbox itself, not the settings panel behind it."""
+            number = getattr(event, "num", None)
+            if number in (4, 6):
+                amount = -1
+            elif number in (5, 7):
+                amount = 1
+            else:
+                amount = -1 if getattr(event, "delta", 0) > 0 else 1
+            self.feature_listbox.yview_scroll(amount, "units")
+            return "break"
+
+        for sequence in ("<MouseWheel>", "<Shift-MouseWheel>", "<Option-MouseWheel>"):
+            self.feature_listbox.bind(sequence, scroll_features, add="+")
+        if sys.platform.startswith("linux"):
+            for sequence in ("<Button-4>", "<Button-5>", "<Button-6>", "<Button-7>"):
+                try:
+                    self.feature_listbox.bind(sequence, scroll_features, add="+")
+                except tk.TclError:
+                    pass
 
     def build_model_settings(self):
         model_frame = ttk.LabelFrame(self.settings_frame, text="2. TimesFM 3.0 Configuration", padding=(10, 5))
@@ -1048,9 +1105,9 @@ class TimesFMApp:
         """Refresh target and covariate choices after the feature table changes."""
         target_values = list(self.historical_data.columns)
         self.feature_catalog = [column for column in target_values if column != self.target_col_var.get()]
-        self.feature_listbox.delete(0, tk.END)
-        for column in self.feature_catalog:
-            self.feature_listbox.insert(tk.END, column)
+        # Keep whatever is still available after a refetch.
+        self.feature_selected &= set(self.feature_catalog)
+        self._render_feature_list()
         for child in self.settings_frame.winfo_children():
             for widget in child.winfo_children():
                 if isinstance(widget, ttk.Combobox) and widget.cget("textvariable") == str(self.target_col_var):
@@ -1058,9 +1115,48 @@ class TimesFMApp:
         if self.target_col_var.get() not in target_values:
             self.target_col_var.set("Close" if "Close" in target_values else target_values[0])
 
+    def _render_feature_list(self):
+        """Show the catalogue filtered by the search box, preserving selection."""
+        needle = self.feature_filter_var.get().strip().lower()
+        self.feature_shown = [
+            column for column in self.feature_catalog if needle in column.lower()
+        ]
+        self.feature_listbox.delete(0, tk.END)
+        for position, column in enumerate(self.feature_shown):
+            self.feature_listbox.insert(tk.END, column)
+            if column in self.feature_selected:
+                self.feature_listbox.selection_set(position)
+        self._update_feature_count()
+
+    def _on_feature_select(self, _event=None):
+        """Sync the selection set from the rows currently on screen."""
+        chosen = set(self.feature_listbox.curselection())
+        for position, column in enumerate(self.feature_shown):
+            if position in chosen:
+                self.feature_selected.add(column)
+            else:
+                self.feature_selected.discard(column)
+        self._update_feature_count()
+
+    def _select_features(self, mode):
+        """All/None act on what the filter is showing, not the whole catalogue."""
+        for column in self.feature_shown:
+            if mode == "all":
+                self.feature_selected.add(column)
+            else:
+                self.feature_selected.discard(column)
+        self._render_feature_list()
+
+    def _update_feature_count(self):
+        if hasattr(self, "feature_count_label"):
+            self.feature_count_label.config(
+                text=f"{len(self.feature_selected)} selected"
+            )
+
     def _selected_covariates(self):
         """Return the feature names selected for TimesFM historical covariates."""
-        return [self.feature_listbox.get(index) for index in self.feature_listbox.curselection()]
+        # From the set, so a covariate hidden by the filter is still used.
+        return [column for column in self.feature_catalog if column in self.feature_selected]
 
     def _prepare_context(self, values, end_index, context_len):
         """Return a finite, patch-sized target context ending at ``end_index``."""
