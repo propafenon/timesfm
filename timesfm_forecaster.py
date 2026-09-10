@@ -11,6 +11,7 @@ import backtest
 import metrics
 import transforms
 import features
+import sk_models
 import csv
 import os  # Added for scanning local model directories
 import sys
@@ -391,6 +392,12 @@ class TimesFMApp:
                         variable=self.bt_timesfm_var
                         ).grid(row=1, column=3, columnspan=5, sticky="w", pady=(6, 0))
 
+        self.bt_svr_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls, text="Include SVR (refits per origin)",
+                        variable=self.bt_svr_var,
+                        state="normal" if sk_models.SKLEARN_AVAILABLE else "disabled"
+                        ).grid(row=1, column=8, columnspan=4, sticky="w", pady=(6, 0))
+
         buttons = ttk.Frame(parent)
         buttons.pack(fill="x", padx=10)
         self.bt_run_btn = ttk.Button(buttons, text="Run Backtest", command=self.thread_run_backtest)
@@ -464,6 +471,26 @@ class TimesFMApp:
                 return space
         return transforms.PRICE
 
+    def _uses_timesfm(self):
+        return not self.model_family_var.get().startswith("SVR")
+
+    def _active_model_fn(self, horizon):
+        """model_fn for the selected family.
+
+        The SVR takes a PRICE context and differences internally, so the "Model
+        in" setting does not apply to it; differencing here as well would
+        difference twice.
+        """
+        if self._uses_timesfm():
+            return self._timesfm_model_fn(horizon)
+        family = self.model_family_var.get()
+        return sk_models.make_svr_forecaster(
+            kernel="linear" if "linear" in family.lower() else "rbf",
+            C=max(float(self.svr_c_var.get()), 1e-6),
+            lags=max(int(self.svr_lags_var.get()), 1),
+            use_covariates=True,
+        )
+
     def _timesfm_model_fn(self, horizon):
         """Wrap the already-loaded model in the backtest's model_fn contract.
 
@@ -533,8 +560,11 @@ class TimesFMApp:
                     self.root.after(0, self.log_message,
                                     f"statsforecast found: added {', '.join(extra)}.")
             covariate_matrix, covariates_used = (None, [])
+            if self.bt_svr_var.get() and sk_models.SKLEARN_AVAILABLE:
+                models.update(sk_models.available_models())
             if self.bt_timesfm_var.get():
                 models["timesfm"] = self._timesfm_model_fn(horizon)
+            if self.bt_timesfm_var.get() or self.bt_svr_var.get():
                 covariate_matrix, covariates_used = self._backtest_covariate_matrix(
                     self._selected_covariates()
                 )
@@ -549,8 +579,13 @@ class TimesFMApp:
                 # Wrapping changes what a baseline means: `naive` on returns
                 # predicts the last return again, which is momentum. Name them
                 # accordingly so the results table does not mislead.
-                models = {f"{name}@{space}": backtest.in_return_space(fn, space)
-                          for name, fn in models.items()}
+                # SVR is exempt: it differences internally, so wrapping it here
+                # would difference twice.
+                models = {
+                    name if name.startswith("svr") else f"{name}@{space}":
+                        fn if name.startswith("svr") else backtest.in_return_space(fn, space)
+                    for name, fn in models.items()
+                }
                 # Keep an unwrapped price-space naive as the anchor of the table.
                 models["naive@price"] = backtest.naive
                 self.root.after(0, self.log_message,
@@ -891,12 +926,28 @@ class TimesFMApp:
 
         # The held-out window is walked, not scored once, so this bounds how
         # many inferences that costs.
+        ttk.Label(model_frame, text="SVR C / lags:").grid(row=11, column=0, sticky="w", pady=2)
+        svr_row = ttk.Frame(model_frame)
+        svr_row.grid(row=11, column=1, sticky="e", pady=2)
+        self.svr_c_var = tk.DoubleVar(value=1.0)
+        self.svr_lags_var = tk.IntVar(value=10)
+        ttk.Entry(svr_row, textvariable=self.svr_c_var, width=5).pack(side=tk.LEFT)
+        ttk.Entry(svr_row, textvariable=self.svr_lags_var, width=4).pack(side=tk.LEFT, padx=(3, 0))
+
         ttk.Label(model_frame, text="Validation origins (max):").grid(row=10, column=0, sticky="w", pady=2)
         self.validation_origins_var = tk.IntVar(value=30)
         ttk.Entry(model_frame, textvariable=self.validation_origins_var, width=10).grid(row=10, column=1, sticky="e", pady=2)
 
         # Levels make the model track trend and contaminate MASE with drift.
         # Returns are stationary and are what a trade actually depends on.
+        ttk.Label(model_frame, text="Model family:").grid(row=8, column=0, sticky="w", pady=2)
+        self.model_family_var = tk.StringVar(value="TimesFM 3.0")
+        families = ["TimesFM 3.0"]
+        if sk_models.SKLEARN_AVAILABLE:
+            families += ["SVR (RBF)", "SVR (linear)"]
+        ttk.Combobox(model_frame, textvariable=self.model_family_var, values=families,
+                     width=14, state="readonly").grid(row=8, column=1, sticky="e", pady=2)
+
         ttk.Label(model_frame, text="Model in:").grid(row=9, column=0, sticky="w", pady=2)
         self.target_space_var = tk.StringVar(value=transforms.SPACE_LABELS[transforms.PRICE])
         ttk.Combobox(model_frame, textvariable=self.target_space_var,
@@ -1481,6 +1532,11 @@ class TimesFMApp:
             # the first observation, which would shift the target one bar
             # relative to covariate columns and silently misalign them.
             space = self._selected_space()
+            if not self._uses_timesfm() and space != transforms.PRICE:
+                space = transforms.PRICE
+                self.root.after(0, self.log_message,
+                                f"{self.model_family_var.get()} fits log returns internally, "
+                                "so the target stays in price space here.")
             if space != transforms.PRICE and selected_covariates:
                 space = transforms.PRICE
                 self.root.after(0, self.log_message,
@@ -1513,14 +1569,19 @@ class TimesFMApp:
             # TimesFM 3 expects one target context and optional covariates as
             # [feature_count, time_steps]; future values are intentionally unknown.
             
-            if not TIMESFM_AVAILABLE:
-                raise ImportError("timesfm library is not available. Cannot run forecast.")
-                
-            # IMPLEMENT MODEL CACHING TO PREVENT OOM CRASHES AND HEAVY BOTTLENECKS
-            current_request_config = self._model_request_config(context_len, horizon)
+            if self._uses_timesfm():
+                if not TIMESFM_AVAILABLE:
+                    raise ImportError("timesfm library is not available. Cannot run forecast.")
 
-            if not self._ensure_model_loaded(current_request_config, context_len, horizon, input_patch_len):
-                self.root.after(0, self.log_message, "Using cached model weights in VRAM/RAM...")
+                # IMPLEMENT MODEL CACHING TO PREVENT OOM CRASHES AND HEAVY BOTTLENECKS
+                current_request_config = self._model_request_config(context_len, horizon)
+                if not self._ensure_model_loaded(current_request_config, context_len, horizon, input_patch_len):
+                    self.root.after(0, self.log_message, "Using cached model weights in VRAM/RAM...")
+            else:
+                # Refitted from the context at every forecast; nothing to load.
+                self.root.after(0, self.log_message,
+                                f"{self.model_family_var.get()}: fitting on the context window "
+                                f"({context_len} bars, {len(selected_covariates)} covariate(s)).")
             
             self.root.after(0, self.log_message, "Running inference on prepared context data...")
 
@@ -1545,8 +1606,8 @@ class TimesFMApp:
             # reference stays "no change" and the numbers stay comparable.
             validation_values = np.asarray(price_series, dtype=float).reshape(-1)
             validation_dates = frame_index
-            validation_model = self._timesfm_model_fn(horizon)
-            if space != transforms.PRICE:
+            validation_model = self._active_model_fn(horizon)
+            if self._uses_timesfm() and space != transforms.PRICE:
                 validation_model = backtest.in_return_space(validation_model, space)
 
             covariate_matrix, covariates_used = self._backtest_covariate_matrix(
@@ -1615,7 +1676,10 @@ class TimesFMApp:
                 run_id = db_manager.insert_backtest_run(
                     ticker=self.tkr_var.get().strip().upper(),
                     interval=self.interval_var.get(), period=self.period_var.get(),
-                    model_name=f"timesfm@validation({space})",
+                    # Name the family that produced it: an SVR run labelled
+                    # "timesfm" is worse than no label in the QC tab.
+                    model_name=f"{'timesfm' if self._uses_timesfm() else self.model_family_var.get()}"
+                               f"@validation({space})",
                     context_length=context_len, horizon_length=horizon,
                     step=origin_step, mode="sliding",
                     adjusted=self.adjusted_var.get(), cost_bps=0.0,
@@ -1654,9 +1718,19 @@ class TimesFMApp:
                 )
 
             # The real forecast uses the full historical context after validation.
-            forecast_result, spread = self._predict_loaded_model(
-                input_context, covariate_array, horizon, want_quantiles=True
-            )
+            if self._uses_timesfm():
+                forecast_result, spread = self._predict_loaded_model(
+                    input_context, covariate_array, horizon, want_quantiles=True
+                )
+            else:
+                # Prices in, prices out: no space transform on this path.
+                price_context = np.asarray(price_series, dtype=float)[-context_len:]
+                svr_covariates = None
+                if covariate_matrix is not None:
+                    svr_covariates = covariate_matrix[:, :len(price_series)][:, -context_len:]
+                forecast_result, spread = self._active_model_fn(horizon)(
+                    price_context, horizon, svr_covariates
+                )
             if spread:
                 self.root.after(0, self.log_message,
                                 f"Captured {len(spread['levels'])} quantile levels.")
