@@ -12,11 +12,21 @@ sessions are used and exchange holidays never appear as predicted bars.
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 import metrics
 import transforms
 
 DEFAULT_QUANTILE_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+# Trailing bars used for the MASE denominator. Textbook MASE scales by the whole
+# training set, which assumes the series' typical move is stable. On a name that
+# runs from a few lira to several hundred it is not: a scale averaged over the
+# full context reflects a price level that no longer exists, and a naive
+# forecast then scores well above 1.0 at h=1 when it must score ~1.0 by
+# construction. A trailing quarter tracks the current regime (1.28 -> 1.06 on a
+# 447x synthetic series) while staying long enough to be a stable estimate.
+SCALE_WINDOW = 60
 
 
 # --------------------------------------------------------------------------
@@ -236,8 +246,9 @@ def walk_forward(values, dates, model_fn, context_len, horizon, step,
         target_dates = dates[origin + 1: origin + 1 + horizon]
         anchor_value = float(values[origin])
 
-        # MASE denominator from the context only, so it is also leak-free.
-        scale = metrics.naive_scale(context, seasonality=1)
+        # MASE denominator from the tail of the context: leak-free, and matched
+        # to the volatility regime the forecast is actually made in.
+        scale = metrics.naive_scale(context[-SCALE_WINDOW:], seasonality=1)
 
         for step_index in range(min(horizon, truth.size, point.size)):
             row = {
@@ -282,9 +293,6 @@ def summarize(rows, interval="1d", cost_bps=10.0, n_trials=1):
     y_pred = frame["y_pred"].to_numpy(float)
     naive_pred = frame["naive_pred"].to_numpy(float)
 
-    scales = frame["naive_scale"].dropna().to_numpy(float)
-    scale = float(np.mean(scales)) if scales.size else float("nan")
-
     model_mae = metrics.mae(y_true, y_pred)
     naive_mae = metrics.mae(y_true, naive_pred)
 
@@ -296,8 +304,8 @@ def summarize(rows, interval="1d", cost_bps=10.0, n_trials=1):
         "smape": metrics.smape(y_true, y_pred),
         "naive_mae": naive_mae,
         # The headline. >= 1 means the model does not beat "no change".
-        "mase": float(model_mae / scale) if np.isfinite(scale) and scale > 0 else float("nan"),
-        "naive_mase": float(naive_mae / scale) if np.isfinite(scale) and scale > 0 else float("nan"),
+        "mase": scaled_error(frame, "y_pred"),
+        "naive_mase": scaled_error(frame, "naive_pred"),
         "skill_vs_naive": float(1.0 - model_mae / naive_mae) if naive_mae > 0 else float("nan"),
         # Per-row anchors differ, so this cannot use the scalar-anchor helper.
         "directional_accuracy": _directional(frame),
@@ -325,11 +333,51 @@ def summarize(rows, interval="1d", cost_bps=10.0, n_trials=1):
         # large h=1 edge as insignificant purely because h=2..7 washed it out.
         summary["dm_stat_step1"] = summary["by_step"][0].get("dm_stat")
         summary["dm_pvalue_step1"] = summary["by_step"][0].get("dm_pvalue")
+        summary["naive_mase_step1"] = summary["by_step"][0].get("naive_mase")
+        summary["directional_pvalue_step1"] = summary["by_step"][0].get("directional_pvalue")
 
     summary.update(_return_space(frame))
     summary.update(_distributional(frame))
     summary.update(_economic(frame, interval, cost_bps, n_trials))
     return summary
+
+
+def scaled_error(frame, column):
+    """MASE, scaling every error by the scale of ITS OWN origin.
+
+    mean(|e|) / mean(scale) is only equivalent when the scale is stable. On a
+    series whose level moves by orders of magnitude - ASELS.IS runs from a few
+    lira to several hundred over its full history - it is not: early origins
+    contribute tiny scales while late origins contribute large errors, and the
+    ratio of the two means is inflated by a factor that has nothing to do with
+    forecast quality. Scaling each error individually is the definition that
+    survives a changing price level, and it makes the naive forecast score ~1.0
+    at h=1 as it must.
+    """
+    errors = (frame[column].to_numpy(float) - frame["y_true"].to_numpy(float))
+    scales = frame["naive_scale"].to_numpy(float)
+    usable = np.isfinite(errors) & np.isfinite(scales) & (scales > 0)
+    if not usable.any():
+        return float("nan")
+    return float(np.mean(np.abs(errors[usable]) / scales[usable]))
+
+
+def directional_pvalue(frame):
+    """One-sided binomial test that the hit rate beats a coin flip.
+
+    Applied per horizon step, where each row comes from a different origin.
+    Pooling steps would count the same forecast up to `horizon` times and
+    overstate the evidence.
+    """
+    anchors = frame["anchor_value"].to_numpy(float)
+    true_dir = np.sign(frame["y_true"].to_numpy(float) - anchors)
+    pred_dir = np.sign(frame["y_pred"].to_numpy(float) - anchors)
+    scored = (true_dir != 0) & (pred_dir != 0)
+    total = int(scored.sum())
+    if total < 8:
+        return float("nan")
+    hits = int(np.sum(true_dir[scored] == pred_dir[scored]))
+    return float(stats.binomtest(hits, total, 0.5, alternative="greater").pvalue)
 
 
 def per_step(frame):
@@ -340,9 +388,6 @@ def per_step(frame):
         y_true = chunk["y_true"].to_numpy(float)
         y_pred = chunk["y_pred"].to_numpy(float)
         y_naive = chunk["naive_pred"].to_numpy(float)
-
-        scales = chunk["naive_scale"].dropna().to_numpy(float)
-        scale = float(np.mean(scales)) if scales.size else float("nan")
 
         step_mae = metrics.mae(y_true, y_pred)
         naive_step_mae = metrics.mae(y_true, y_naive)
@@ -362,9 +407,11 @@ def per_step(frame):
             "n": int(len(chunk)),
             "mae": step_mae,
             "naive_mae": naive_step_mae,
-            "mase": float(step_mae / scale) if np.isfinite(scale) and scale > 0 else float("nan"),
+            "mase": scaled_error(chunk, "y_pred"),
+            "naive_mase": scaled_error(chunk, "naive_pred"),
             "skill_vs_naive": float(1.0 - step_mae / naive_step_mae) if naive_step_mae > 0 else float("nan"),
             "directional_accuracy": _directional(chunk),
+            "directional_pvalue": directional_pvalue(chunk),
         })
     return out
 

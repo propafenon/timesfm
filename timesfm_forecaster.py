@@ -405,8 +405,8 @@ class TimesFMApp:
         self.bt_progress.pack(fill="x", padx=10)
 
         columns = ("ID", "Model", "Origins", "MASE h1", "MASE all", "Skill%",
-                   "Skill r%", "Dir%", "DM p", "CRPS", "Cov80", "IC", "Sharpe",
-                   "MaxDD", "DSR")
+                   "Skill r%", "Dir%", "Dir p", "DM p h1", "DM p", "CRPS",
+                   "Cov80", "IC", "Sharpe", "MaxDD", "DSR")
         results = ttk.LabelFrame(parent, text="Results  (MASE < 1 beats naive; DSR is the "
                                               "probability the Sharpe survives how many configs you tried)",
                                  padding=(10, 5))
@@ -683,6 +683,8 @@ class TimesFMApp:
                 # Return-space skill: drift-free, and the honest read.
                 self._fmt(summary.get("skill_returns"), ".1f", 100.0, "%"),
                 self._fmt(summary.get("directional_accuracy"), ".0f", 100.0, "%"),
+                self._fmt(summary.get("directional_pvalue_step1")),
+                self._fmt(summary.get("dm_pvalue_step1")),
                 self._fmt(summary.get("dm_pvalue_vs_naive")),
                 self._fmt(summary.get("crps"), ".4f"),
                 self._fmt(summary.get("coverage_80"), ".0f", 100.0, "%"),
@@ -1592,8 +1594,12 @@ class TimesFMApp:
                 ("NaiveMAE", summary.get("naive_mae")),
                 ("SkillVsNaive", summary.get("skill_vs_naive")),
                 ("MASE_h1", summary.get("mase_step1")),
+                # Naive's own MASE, as a sanity check: it must sit near 1.0, so
+                # a wild MASE_h1 is visibly the model and not the yardstick.
+                ("NaiveMASE_h1", summary.get("naive_mase_step1")),
                 ("MASE_all", summary.get("mase")),
                 ("DirectionalAccuracy", summary.get("directional_accuracy")),
+                ("Dir_p_h1", summary.get("directional_pvalue_step1")),
                 ("DM_p_h1", summary.get("dm_pvalue_step1")),
                 ("DM_p_pooled", summary.get("dm_pvalue_vs_naive")),
             ]

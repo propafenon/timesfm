@@ -1,6 +1,7 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np, pandas as pd, backtest as bt, metrics as m
+import metrics
 
 # ---- LEAKAGE: a model that peeks would see these sentinels -------------
 n=200
@@ -166,4 +167,54 @@ print("  -> the verdict must quote the p-value matching the horizon it claims")
 for entry in ssum["by_step"]:
     assert "dm_pvalue" in entry, entry.keys()
 print("every horizon step carries its own DM statistic")
+
+# ---- MASE must survive a price level that moves by orders of magnitude ----
+# ASELS.IS runs from a few lira to several hundred over its full history. The
+# old mean(|e|)/mean(scale) pooling reported MASE ~5 for a naive forecast that
+# must score ~1.0 at h=1 by construction.
+rng3 = np.random.default_rng(31)
+n3 = 3000
+# 1 TRY -> ~400 TRY, so early scales are ~100x smaller than late errors
+level = 1.0 * np.exp(np.cumsum(rng3.normal(0.002, 0.02, n3)))
+dates4 = pd.bdate_range("2013-01-02", periods=n3)
+nrows3 = bt.walk_forward(level, dates4, bt.naive, 256, 7, 45)
+nsum3 = bt.summarize(nrows3, interval="1d")
+
+print(f"\nprice level {level[0]:.2f} -> {level[-1]:.1f} ({level[-1]/level[0]:.0f}x)")
+print(f"  naive MASE h=1 = {nsum3['by_step'][0]['naive_mase']:.3f}  (must be ~1.0)")
+# Not exactly 1.0: even a trailing scale window lags a trending series slightly.
+# The old pooling reported ~5 on data like this.
+assert 0.85 < nsum3["by_step"][0]["naive_mase"] < 1.25, nsum3["by_step"][0]["naive_mase"]
+assert abs(nsum3["by_step"][0]["mase"] - nsum3["by_step"][0]["naive_mase"]) < 1e-9
+print("SCALED ERROR: naive scores ~1.0 at h=1 despite a 400x change in level")
+
+# Like-for-like at h=1, where the naive forecast must score 1.0: the two
+# poolings on identical rows and identical scales.
+frame3 = pd.DataFrame(nrows3)
+h1 = frame3[frame3["step"] == 1]
+errors_h1 = np.abs(h1["naive_pred"].to_numpy(float) - h1["y_true"].to_numpy(float))
+scales_h1 = h1["naive_scale"].to_numpy(float)
+ok = np.isfinite(errors_h1) & np.isfinite(scales_h1) & (scales_h1 > 0)
+per_row = float(np.mean(errors_h1[ok] / scales_h1[ok]))         # the fix
+ratio_of_means = float(np.mean(errors_h1[ok]) / np.mean(scales_h1[ok]))  # the bug
+print(f"  h=1 naive: per-row scaling {per_row:.3f} vs ratio-of-means {ratio_of_means:.3f}")
+assert abs(per_row - 1.0) < abs(ratio_of_means - 1.0), (per_row, ratio_of_means)
+print("  per-row scaling lands nearer the 1.0 a naive forecast must score")
+
+# MASE still grows with the horizon, as it must
+step_mases = [r["mase"] for r in nsum3["by_step"]]
+assert step_mases[-1] > step_mases[0], step_mases
+print(f"  MASE by step: {' '.join(f'{m:.2f}' for m in step_mases)} (grows with h)")
+
+# ---- directional accuracy gets a significance test ------------------------
+assert nsum3["by_step"][0]["directional_pvalue"] != nsum3["by_step"][0]["directional_pvalue"] \
+    or 0.0 <= nsum3["by_step"][0]["directional_pvalue"] <= 1.0
+def always_up(context, horizon):
+    return np.full(horizon, float(context[-1]) * 1.05), None
+up_rows = bt.walk_forward(level, dates4, always_up, 256, 7, 45)
+up_sum = bt.summarize(up_rows, interval="1d")
+print(f"  a permanently-bullish model on an uptrend: dir={up_sum['directional_accuracy']:.3f}, "
+      f"p={up_sum['by_step'][0]['directional_pvalue']:.4f}")
+assert 0.0 <= up_sum["by_step"][0]["directional_pvalue"] <= 1.0
+print("DIRECTIONAL: hit rate now carries a one-sided binomial p-value per step")
 print("\nALL BACKTEST TESTS PASSED")

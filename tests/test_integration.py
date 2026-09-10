@@ -123,7 +123,7 @@ by_model = {r[1].split(" ")[0]: r for r in results}
 assert "naive" in by_model, by_model.keys()
 # Columns: 5 Skill%, 6 Skill r%, 7 Dir%
 # A flat forecast has no directional view; it must read as "-", not 0%.
-assert by_model["naive"][7] == "-", by_model["naive"]
+assert by_model["naive"][7] == "-", by_model["naive"]  # Dir% column
 # Naive against itself has exactly zero skill in both spaces.
 assert by_model["naive"][5] == "0.0%", by_model["naive"]
 assert by_model["naive"][6] in ("0.0%", "-"), by_model["naive"]
