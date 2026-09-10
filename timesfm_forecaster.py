@@ -12,6 +12,7 @@ import metrics
 import transforms
 import features
 import sk_models
+import vol_models
 import csv
 import os  # Added for scanning local model directories
 import sys
@@ -377,6 +378,15 @@ class TimesFMApp:
         ttk.Combobox(controls, textvariable=self.bt_mode_var, values=["sliding", "expanding"],
                      width=10, state="readonly").grid(row=0, column=9, sticky="w")
 
+        ttk.Label(controls, text="Forecast:").grid(row=2, column=0, sticky="w", padx=(8, 2), pady=(6, 0))
+        self.bt_target_var = tk.StringVar(value="Price level")
+        ttk.Combobox(controls, textvariable=self.bt_target_var,
+                     values=["Price level", "Realized volatility"],
+                     width=18, state="readonly").grid(row=2, column=1, columnspan=2,
+                                                      sticky="w", pady=(6, 0))
+        ttk.Label(controls, text="(volatility is the one that is actually predictable)"
+                  ).grid(row=2, column=3, columnspan=6, sticky="w", pady=(6, 0))
+
         ttk.Label(controls, text="Model in:").grid(row=0, column=10, sticky="w", padx=(8, 2))
         self.bt_space_var = tk.StringVar(value=transforms.SPACE_LABELS[transforms.LOG_RETURN])
         ttk.Combobox(controls, textvariable=self.bt_space_var,
@@ -534,6 +544,24 @@ class TimesFMApp:
 
             values = series.to_numpy(float)
             dates = series.index
+
+            forecasting_volatility = self.bt_target_var.get().startswith("Realized")
+            if forecasting_volatility:
+                # Switch the series being forecast to daily realized volatility.
+                # The naive reference becomes "tomorrow's volatility equals
+                # today's", which is the benchmark HAR-RV has to beat.
+                volatility = vol_models.realized_volatility(values, window=1)
+                usable = np.isfinite(volatility) & (volatility > 0)
+                values = volatility[usable]
+                dates = pd.DatetimeIndex(dates[1:])[usable]
+                if values.size < 200:
+                    raise ValueError(
+                        f"Only {values.size} usable volatility observations; "
+                        "fetch a longer period."
+                    )
+                self.root.after(0, self.log_message,
+                                f"Forecasting realized volatility: {values.size} observations, "
+                                f"median {float(np.median(values)):.3f} annualised.")
             context_len = int(self.bt_context_var.get())
             horizon = int(self.bt_horizon_var.get())
             step = max(int(self.bt_step_var.get()), 1)
@@ -560,6 +588,10 @@ class TimesFMApp:
                     self.root.after(0, self.log_message,
                                     f"statsforecast found: added {', '.join(extra)}.")
             covariate_matrix, covariates_used = (None, [])
+            if forecasting_volatility:
+                # HAR-RV and EWMA only make sense on a volatility series, so
+                # they appear exactly here and nowhere else.
+                models.update(vol_models.available_models())
             if self.bt_svr_var.get() and sk_models.SKLEARN_AVAILABLE:
                 models.update(sk_models.available_models())
             if self.bt_timesfm_var.get():
@@ -574,6 +606,12 @@ class TimesFMApp:
                                     "re-sliced at every origin.")
             if not models:
                 raise ValueError("Select at least one model to backtest.")
+
+            if forecasting_volatility and space != transforms.PRICE:
+                space = transforms.PRICE
+                self.root.after(0, self.log_message,
+                                "Volatility is already a differenced quantity; "
+                                "modelling stays in level space for it.", "warning")
 
             if space != transforms.PRICE:
                 # Wrapping changes what a baseline means: `naive` on returns
@@ -618,11 +656,20 @@ class TimesFMApp:
 
                 summary = backtest.summarize(rows, interval=interval,
                                              cost_bps=cost_bps, n_trials=n_trials)
+                if forecasting_volatility:
+                    # Sharpe from the sign of a predicted volatility change is
+                    # not a strategy; drop it rather than print a number that
+                    # invites the wrong reading.
+                    for key in ("sharpe_net", "sharpe_gross", "max_drawdown",
+                                "hit_rate", "profit_factor", "turnover",
+                                "deflated_sharpe", "ic"):
+                        summary.pop(key, None)
                 table[name] = summary
 
                 run_id = db_manager.insert_backtest_run(
                     ticker=ticker, interval=interval, period=self.period_var.get(),
-                    model_name=name, context_length=context_len, horizon_length=horizon,
+                    model_name=f"{name}@vol" if forecasting_volatility else name,
+                    context_length=context_len, horizon_length=horizon,
                     step=step, mode=mode, adjusted=self.adjusted_var.get(),
                     cost_bps=cost_bps, n_origins=summary.get("n_origins"),
                     n_points=summary.get("n_points"), summary=summary,
